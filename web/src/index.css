@@ -1,0 +1,129 @@
+* { box-sizing: border-box; }
+
+html, body, #root {
+  margin: 0;
+  padding: 0;
+  height: 100%;
+}
+
+body {
+  font-family: -apple-system, BlinkMacSystemFont, 'Microsoft YaHei', 'PingFang SC', sans-serif;
+  background: #f5f6f7;
+  color: #1f2328;
+}
+
+.page {
+  max-width: 1120px;
+  margin: 0 auto;
+  padding: 24px;
+}
+
+.page-narrow {
+  max-width: 640px;
+  margin: 0 auto;
+  padding: 24px;
+}
+
+.auth-wrap {
+  min-height: 100vh;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: linear-gradient(135deg, #e8f5ee 0%, #f5f6f7 100%);
+}
+
+.auth-card {
+  width: 420px;
+  background: #fff;
+  border-radius: 12px;
+  padding: 32px;
+  box-shadow: 0 4px 24px rgba(0, 0, 0, 0.06);
+}
+
+.brand {
+  font-size: 20px;
+  font-weight: 600;
+  color: #2c6e49;
+  letter-spacing: 0.5px;
+}
+
+.metric-value {
+  font-variant-numeric: tabular-nums;
+  font-size: 22px;
+  font-weight: 600;
+}
+
+.metric-formula {
+  font-family: ui-monospace, Consolas, monospace;
+  font-size: 12px;
+  color: #8c959f;
+}
+
+.dragger-hint {
+  color: #8c959f;
+  font-size: 13px;
+}
+
+.confidence-bar {
+  display: inline-block;
+  width: 60px;
+  height: 6px;
+  border-radius: 3px;
+  background: #e5e7eb;
+  overflow: hidden;
+  vertical-align: middle;
+  margin-right: 8px;
+}
+
+.confidence-fill {
+  height: 100%;
+  border-radius: 3px;
+}
+
+.phase-timeline {
+  padding: 8px 0;
+}
+
+.phase-line {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 6px 0;
+  font-size: 14px;
+}
+
+.phase-dot {
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  background: #d9d9d9;
+  flex-shrink: 0;
+}
+
+.phase-dot.active {
+  background: #2c6e49;
+  box-shadow: 0 0 0 4px rgba(44, 110, 73, 0.15);
+}
+
+.phase-dot.done {
+  background: #52c41a;
+}
+
+.report-frame {
+  width: 100%;
+  min-height: 720px;
+  border: 1px solid #e5e7eb;
+  border-radius: 8px;
+  background: #fff;
+}
+
+.trace-row {
+  font-size: 13px;
+  line-height: 2;
+}
+
+.trace-label {
+  display: inline-block;
+  width: 84px;
+  color: #8c959f;
+}

@@ -1,0 +1,383 @@
+"""形态 B：Agent 引擎 —— LLM 循环（docs/14）。
+
+这是本项目第一个真正的 Agent 循环（v1.4）：
+    模型决定调用什么工具 → 执行 → 看结果 → 决定下一步 → 直到给出回答。
+
+四条硬纪律（每条都有对应机制）：
+  1. **数字只来自工具**：system prompt 明令禁止编造数字；工具返回什么就是什么
+  2. **LoopGuard**：相同调用第 3 次阻止、连败 8 次终止
+  3. **上下文超限必压缩**：接入 v1.3 的 Compressor（L1/L2；summarizer 未注入）
+  4. **成本必记账**：每次 LLM 调用的 usage（含 reasoning tokens）进 usage_records
+"""
+
+from __future__ import annotations
+
+import json
+import time
+from dataclasses import dataclass, field
+
+from app.config import get_settings
+from app.memory import Compressor, TokenEstimator
+from app.services import billing
+from app.services.llm_client import LlmClient, LlmError
+
+__all__ = ['AgentEngine', 'AgentTurnResult', 'LoopGuard', 'build_tools']
+
+MAX_TURNS = 8                       # 循环步数上限（防失控）
+CONTEXT_BUDGET_TOKENS = 60_000      # 触发压缩的消息区预算（保守值）
+
+
+class LoopGuard:
+    """循环守卫（阈值 3 / 3 / 8）。
+
+    - IDENTICAL_CALL_BLOCK：相同 (工具+参数) 第 3 次出现 → 阻止该次调用
+    - FAILURE_WARN：同一工具连续失败 3 次 → 警告注入
+    - FAILURE_HALT：累计连续失败 8 次 → 终止循环
+    """
+
+    IDENTICAL_CALL_BLOCK = 3
+    FAILURE_WARN = 3
+    FAILURE_HALT = 8
+
+    def __init__(self):
+        self._call_counts: dict[str, int] = {}
+        self._fails_by_tool: dict[str, int] = {}
+        self._consecutive_fails = 0
+        self.warnings: list[str] = []
+        self.blocked: list[str] = []
+
+    def check_call(self, name: str, args: str) -> tuple[bool, str]:
+        key = f'{name}:{args}'
+        n = self._call_counts.get(key, 0) + 1
+        self._call_counts[key] = n
+        if n >= self.IDENTICAL_CALL_BLOCK:
+            self.blocked.append(key)
+            return False, (f'该调用已重复 {n} 次 —— 已被循环守卫阻止。'
+                           f'请换一种参数或基于已有结果作答。')
+        return True, ''
+
+    def record_result(self, name: str, ok: bool) -> bool:
+        """记录工具成败。返回 False = 连续失败超限，应终止循环。"""
+        if ok:
+            self._fails_by_tool[name] = 0
+            self._consecutive_fails = 0
+            return True
+        self._fails_by_tool[name] = self._fails_by_tool.get(name, 0) + 1
+        self._consecutive_fails += 1
+        if self._fails_by_tool[name] == self.FAILURE_WARN:
+            self.warnings.append(f'工具 {name} 已连续失败 '
+                                 f'{self._fails_by_tool[name]} 次')
+        return self._consecutive_fails < self.FAILURE_HALT
+
+
+@dataclass
+class AgentTurnResult:
+    answer: str = ''
+    tool_trace: list[dict] = field(default_factory=list)   # 工具调用轨迹（溯源）
+    turns: int = 0
+    cost_usd: float = 0.0
+    input_tokens: int = 0
+    output_tokens: int = 0
+    reasoning_tokens: int = 0
+    guard_warnings: list[str] = field(default_factory=list)
+    error: str = ''
+
+
+# ---------------------------------------------------------------------------
+# 工具集（全部是既有确定性函数的封装 —— 模型调用它们，天然带溯源）
+# ---------------------------------------------------------------------------
+
+def build_tools(reg, con_getter) -> tuple[list[dict], dict]:
+    """返回 (OpenAI tools 规格, 工具实现表)。
+
+    con_getter: () -> DuckDB 连接（惰性获取，工具内使用后归还）。
+    """
+    spec = [
+        {'type': 'function', 'function': {
+            'name': 'list_metrics',
+            'description': '列出可计算的指标目录（ID、名称、口径、公式）。',
+            'parameters': {'type': 'object', 'properties': {},
+                           'required': []}}},
+        {'type': 'function', 'function': {
+            'name': 'compute_metric',
+            'description': '计算一个指标的值。metric_id 见 list_metrics；'
+                           'time_range 形如 "2026-09-01~2026-09-28"，留空=全部数据。',
+            'parameters': {'type': 'object', 'properties': {
+                'metric_id': {'type': 'string'},
+                'time_range': {'type': 'string', 'description': '可留空'}},
+                'required': ['metric_id']}}},
+        {'type': 'function', 'function': {
+            'name': 'product_breakdown',
+            'description': '按商品拆解销售/退款/毛利率，并标记异常商品（重点关注）。'
+                           '适合回答"哪个商品有问题"。',
+            'parameters': {'type': 'object', 'properties': {
+                'time_range': {'type': 'string', 'description': '可留空'}},
+                'required': []}}},
+        {'type': 'function', 'function': {
+            'name': 'weekly_compare',
+            'description': '按周对比访客/转化率/净销售额/退款率/ROI，'
+                           '并指出变化最大的维度。适合"第几周发生了什么"。',
+            'parameters': {'type': 'object', 'properties': {
+                'time_range': {'type': 'string', 'description': '可留空'}},
+                'required': []}}},
+        {'type': 'function', 'function': {
+            'name': 'anomaly_days',
+            'description': '检测异常日（偏离前 7 日均值 ≥35%），返回特征描述'
+                           '与建议核对方向。适合"哪天不对劲/有没有波动"。',
+            'parameters': {'type': 'object', 'properties': {
+                'time_range': {'type': 'string', 'description': '可留空'}},
+                'required': []}}},
+    ]
+
+    from app.services.diagnosis import (
+        _build_product_breakdown, _build_trend, _build_weekly_compare,
+        _detect_anomaly_days, _open_semantic_db,
+    )
+    from app.semantic.timerange import parse_range
+
+    def _tr(text):
+        if not text:
+            return None
+        try:
+            return parse_range(text)
+        except Exception:                       # noqa: BLE001
+            return None
+
+    def _list_metrics(_args: dict) -> str:
+        rows = []
+        for m in reg.all():
+            note = {'high': '（口径待确认）', 'medium': '（部分待确认）'}.get(
+                m.uncertainty.level.value if hasattr(m, 'uncertainty') and
+                m.uncertainty else '', '')
+            rows.append(f'{m.metric_id} {m.metric_name}{note}：'
+                        f'{m.formula_expression}')
+        return '\n'.join(rows) or '（无指标）'
+
+    def _compute_metric(args: dict) -> str:
+        from app.semantic.registry import SemanticRegistry
+        from app.services.diagnosis import _apply_semantic_upgrades
+        con = con_getter()
+        try:
+            _apply_semantic_upgrades(con)
+            r2 = SemanticRegistry(con)
+            r2.load()
+            from app.semantic.renderer import SQLRenderer
+            rq = SQLRenderer(r2).render(metric_id=args['metric_id'],
+                                        time_range=_tr(args.get('time_range')))
+            row = con.execute(rq.sql, rq.params).fetchone()
+            value = row[0] if row else None
+            if value is None:
+                return f'{args["metric_id"]}：该范围内无数据'
+            unit = rq.unit or ''
+            if unit == 'percent':
+                vs = f'{value * 100:.2f}%'
+            elif unit == 'currency':
+                vs = f'¥{value:,.2f}'
+            else:
+                vs = f'{value:,}'
+            foot = f'；口径：{rq.footnote}' if rq.footnote else ''
+            return f'{args["metric_id"]} = {vs}{foot}'
+        except Exception as e:                  # noqa: BLE001
+            return f'计算失败：{e}'
+
+    def _products(args: dict) -> str:
+        rows = _build_product_breakdown(con_getter(), _tr(args.get('time_range')))
+        if not rows:
+            return '无商品维度数据（需先上传订单数据）'
+        out = []
+        for p in rows[:10]:
+            name = p['title'] or p['merchant_code'] or p['item_id']
+            extra = (f'；主因 {p["top_refund_reason"]}'
+                     if p['top_refund_reason'] and p['refund_amount'] > 0 else '')
+            flag = '；⚠' + '/'.join(p['flags']) if p['flags'] else ''
+            out.append(f'{name}：占比{p["share"] * 100:.0f}% '
+                       f'支付¥{p["pay_amount"]:,.0f} 净销¥{p["net_sales"]:,.0f} '
+                       f'退款率{p["refund_rate"] * 100:.1f}%'
+                       f'{" 毛利率" + format((p["margin_rate"] or 0) * 100, ".1f") + "%" if p["margin_rate"] is not None else ""}'
+                       f'{extra}{flag}')
+        return '\n'.join(out)
+
+    def _weekly(args: dict) -> str:
+        w = _build_weekly_compare(con_getter(), _tr(args.get('time_range')))
+        weeks = w.get('weeks') or []
+        if not weeks:
+            return '无周度数据'
+        out = [f"{x['label'][5:]}起({x.get('days', 7)}天): 访客{x['visitors']:,} "
+               f"净销¥{x['net_sales']:,.0f} 退款率{x['refund_rate'] * 100:.1f}% "
+               f"ROI{x.get('roi') if x.get('roi') is not None else '—'}"
+               for x in weeks]
+        big = w.get('biggest')
+        if big:
+            out.append(f"变化最大: {big['metric']} 末周{big['last']} vs 均{big['base']}"
+                       f" ({'↑' if big['delta'] > 0 else '↓'}{abs(big['delta']) * 100:.0f}%)")
+        return '\n'.join(out)
+
+    def _anomalies(args: dict) -> str:
+        trend = _build_trend(con_getter(), _tr(args.get('time_range')))
+        anoms = _detect_anomaly_days(trend)
+        if not anoms:
+            return '未检测到异常日'
+        return '\n'.join(f"{a['date']}: {'；'.join(a['features'])} → {a['note']}"
+                         for a in anoms[:8])
+
+    impl = {
+        'list_metrics': _list_metrics,
+        'compute_metric': _compute_metric,
+        'product_breakdown': _products,
+        'weekly_compare': _weekly,
+        'anomaly_days': _anomalies,
+    }
+    return spec, impl
+
+
+SYSTEM_PROMPT = '''你是淘宝店铺的经营分析助手。数据已由用户上传并完成清洗，存于语义层。
+
+工作纪律（必须遵守）：
+1. 你回答中的**每一个数字**必须来自工具返回结果，禁止编造或凭记忆估算。
+2. 先用工具查证，再下结论；比较类问题先拿到两边的数再比较。
+3. 工具返回"无数据"时如实告知，不要猜。
+4. 回答末尾注明关键口径（工具结果里带"口径："的都要转达）。
+5. 回答用中文，简洁、直接给结论，再给依据。适合淘宝卖家阅读。'''
+
+
+class AgentEngine:
+    """形态 B 的循环本体。一次 run() = 处理一个用户问题的完整循环。"""
+
+    def __init__(self, client: LlmClient, tenant_id: str,
+                 tools_spec: list[dict], tools_impl: dict,
+                 max_turns: int = MAX_TURNS):
+        self.client = client
+        self.tenant_id = tenant_id
+        self.tools_spec = tools_spec
+        self.tools_impl = tools_impl
+        self.max_turns = max_turns
+        s = get_settings()
+        self.compressor = Compressor(
+            estimator=TokenEstimator(),
+            summarizer=None,                 # L3 摘要需注入 LLM，二期接
+            budget_tokens=CONTEXT_BUDGET_TOKENS,
+            keep_recent=10,
+        )
+        self.model = s.llm_model
+
+    # ------------------------------------------------------------------
+
+    def run(self, question: str, history: list[dict] | None = None,
+            data_context: str = '') -> AgentTurnResult:
+        """执行一轮 Agent 循环。
+
+        history: 之前的对话 [{'role','content'}]（多轮上下文）。
+        data_context: 数据范围说明（docs/15）—— 注入 system prompt，
+            模型回答时可主动说明"本回答基于哪些文件、哪个周期"。
+        """
+        res = AgentTurnResult()
+        guard = LoopGuard()
+        system = SYSTEM_PROMPT
+        if data_context:
+            system += f'\n\n{data_context}'
+        messages: list[dict] = [{'role': 'system', 'content': system}]
+        messages += (history or [])[-20:]          # 最近 20 条历史
+        messages.append({'role': 'user', 'content': question})
+
+        try:
+            for turn in range(self.max_turns):
+                res.turns = turn + 1
+
+                # 上下文预算检查 → 压缩（v1.3 库的第二个用户）
+                if self.compressor.should_compress(messages):
+                    cr = self.compressor.compress(messages)
+                    messages = cr.messages
+                    if cr.events:
+                        res.tool_trace.append({'tool': '_compress',
+                                               'level': cr.level,
+                                               'events': cr.events[:3]})
+
+                resp = self.client.chat(messages, tools=self.tools_spec,
+                                        temperature=0.2)
+                self._record_usage(res, resp)
+
+                if not resp.wants_tool:
+                    res.answer = resp.content or '（模型未返回内容）'
+                    res.guard_warnings = guard.warnings
+                    return res
+
+                messages.append({'role': 'assistant', 'content': resp.content,
+                                 'tool_calls': [
+                                     {'id': c['id'], 'type': 'function',
+                                      'function': {'name': c['name'],
+                                                   'arguments': c['arguments']}}
+                                     for c in resp.tool_calls]})
+
+                for call in resp.tool_calls:
+                    ok, block_msg = guard.check_call(call['name'],
+                                                     call['arguments'])
+                    if not ok:
+                        result_text = block_msg
+                    else:
+                        result_text = self._dispatch(call['name'],
+                                                     call['arguments'])
+                    ok_call = not result_text.startswith(('计算失败', '该调用已重复'))
+                    if not guard.record_result(call['name'], ok_call):
+                        res.error = (f'循环终止：连续失败 {LoopGuard.FAILURE_HALT} 次'
+                                     f'（工具 {call["name"]}）')
+                        res.guard_warnings = guard.warnings
+                        return res
+                    res.tool_trace.append({'tool': call['name'],
+                                           'args': call['arguments'][:200],
+                                           'result': result_text[:300]})
+                    messages.append({'role': 'tool',
+                                     'tool_call_id': call['id'],
+                                     'content': result_text[:4000]})
+
+            # 步数耗尽 → 强制收口
+            messages.append({'role': 'user', 'content':
+                             '（步数已达上限，请基于已获得的信息直接回答，'
+                             '不要再调用工具）'})
+            resp = self.client.chat(messages, temperature=0.2)
+            self._record_usage(res, resp)
+            res.answer = resp.content or '（超步数且未获得回答）'
+            res.guard_warnings = guard.warnings
+            return res
+
+        except LlmError as e:
+            res.error = f'LLM 调用失败: {e}'
+            return res
+        except Exception as e:                      # noqa: BLE001
+            res.error = f'{type(e).__name__}: {e}'
+            return res
+
+    # ------------------------------------------------------------------
+
+    def _dispatch(self, name: str, args_json: str) -> str:
+        fn = self.tools_impl.get(name)
+        if fn is None:
+            return f'计算失败：未知工具 {name}'
+        try:
+            args = json.loads(args_json) if args_json and \
+                args_json.strip().startswith('{') else {}
+        except json.JSONDecodeError:
+            args = {}
+        try:
+            return fn(args)
+        except Exception as e:                      # noqa: BLE001
+            return f'计算失败：{type(e).__name__}: {e}'
+
+    def _record_usage(self, res: AgentTurnResult, resp) -> None:
+        res.input_tokens += resp.input_tokens
+        res.output_tokens += resp.output_tokens
+        res.reasoning_tokens += resp.reasoning_tokens
+        res.cost_usd = round(_estimate_cost(res.input_tokens,
+                                            res.output_tokens), 6)
+        try:
+            billing.record_cost(self.tenant_id, res.cost_usd, model=self.model,
+                                input_tokens=resp.input_tokens,
+                                output_tokens=resp.output_tokens,
+                                reasoning_tokens=resp.reasoning_tokens)
+        except Exception:                           # noqa: BLE001
+            pass                                    # 记账失败不阻断对话
+
+
+def _estimate_cost(input_tokens: int, output_tokens: int) -> float:
+    """粗估成本（USD）—— qwen3.8-flash 量级，reasoning 计入输出侧。"""
+    return (input_tokens / 1_000_000 * 0.11
+            + output_tokens / 1_000_000 * 0.55)

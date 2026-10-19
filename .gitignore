@@ -1,0 +1,96 @@
+# ============================================================================
+# 企业生产级数据分析 Agent —— Git 忽略规则
+# ============================================================================
+
+# --- 密钥与配置（最高优先级：绝不提交）---
+.env
+.env.*
+!.env.template
+*.pem
+*.key
+*.p12
+secrets/
+.credentials/
+
+# --- 客户数据（合规红线）---
+tenants/
+data/
+uploads/
+reports/
+*.duckdb
+*.duckdb.wal
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+dist/
+*.egg-info/
+.eggs/
+.venv/
+venv/
+env/
+.python-version
+
+# --- 测试与缓存 ---
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+.mypy_cache/
+.ruff_cache/
+.hypothesis/
+
+# --- 前端 ---
+web/node_modules/
+web/dist/
+web/.vite/
+web/coverage/
+*.tsbuildinfo
+
+# --- 编辑器 ---
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# --- 操作系统 ---
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# --- 日志与临时 ---
+*.log
+logs/
+tmp/
+temp/
+.piptmp/
+.pylibs/
+
+# --- 备份 ---
+*.bak
+*.backup
+*~
+
+# --- 会话与产物（含客户数据，绝不提交）---
+.agent/
+artifacts/
+
+# --- 本地私有资料（不上传）---
+harness_py/
+harness_py_pro/
+docs/
+CLAUDE.md
+README.local.md
+
+# --- 前端依赖缓存与构建临时目录 ---
+.npmcache/
+.esbtmp/
+.testtmp/
+web/dist/
+web/node_modules/

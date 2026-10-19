@@ -1,0 +1,118 @@
+# ============================================================================
+# Git 行尾与二进制属性
+# 规则：源码/配置/文档入库统一 LF；Windows 脚本检出 CRLF；数据/媒体按二进制处理
+# 生效方式：首次加入后执行 `git add --renormalize .` 让历史工作区文件按新规则重算
+# ============================================================================
+
+# ---------- 默认：文本文件自动识别，入库 LF ----------
+* text=auto eol=lf
+
+# ---------- 源码与配置（强制 LF，跨平台统一）----------
+*.py      text eol=lf
+*.ts      text eol=lf
+*.tsx     text eol=lf
+*.js      text eol=lf
+*.jsx     text eol=lf
+*.mjs     text eol=lf
+*.cjs     text eol=lf
+*.css     text eol=lf
+*.scss    text eol=lf
+*.less    text eol=lf
+*.html    text eol=lf
+*.htm     text eol=lf
+*.xml     text eol=lf
+*.svg     text eol=lf
+*.json    text eol=lf
+*.jsonc   text eol=lf
+*.yaml    text eol=lf
+*.yml     text eol=lf
+*.toml    text eol=lf
+*.ini     text eol=lf
+*.cfg     text eol=lf
+*.sql     text eol=lf
+*.sh      text eol=lf
+*.bash    text eol=lf
+*.zsh     text eol=lf
+*.env     text eol=lf
+*.env.*   text eol=lf
+!.env.template   text eol=lf
+*.md      text eol=lf
+*.txt     text eol=lf
+*.lock    text eol=lf
+
+# ---------- Windows 脚本（检出 CRLF，PowerShell/cmd 友好）----------
+*.ps1     text eol=crlf
+*.psm1    text eol=crlf
+*.bat     text eol=crlf
+*.cmd     text eol=crlf
+
+# ---------- 二进制：禁止 diff / 自动合并 / 行尾转换 ----------
+# 数据库与嵌入式存储
+*.db      binary
+*.db-wal  binary
+*.db-shm  binary
+*.duckdb  binary
+*.duckdb-wal binary
+*.sqlite  binary
+*.sqlite3 binary
+
+# Excel / 办公文档（sample-data.xlsx 等）
+*.xlsx    binary
+*.xls     binary
+*.xlsm    binary
+*.xlsb    binary
+*.docx    binary
+*.doc     binary
+*.pptx    binary
+*.ppt     binary
+*.pdf     binary
+
+# 图片
+*.png     binary
+*.jpg     binary
+*.jpeg    binary
+*.gif     binary
+*.bmp     binary
+*.webp    binary
+*.ico     binary
+
+# 字体
+*.ttf     binary
+*.otf     binary
+*.woff    binary
+*.woff2   binary
+*.eot     binary
+
+# 压缩包 / 归档
+*.zip     binary
+*.tar     binary
+*.gz      binary
+*.tgz     binary
+*.bz2     binary
+*.7z      binary
+*.rar     binary
+
+# 可执行 / 密钥
+*.exe     binary
+*.dll     binary
+*.so      binary
+*.dylib   binary
+*.pem     binary
+*.key     binary
+*.p12     binary
+*.pfx     binary
+
+# Python 构建产物
+*.pyc     binary
+*.pyo     binary
+*.pyd     binary
+*.egg     binary
+*.whl     binary
+
+# ---------- 锁文件不做 diff（减少 PR 噪音；合并仍由 Git 处理）----------
+web/package-lock.json   -diff
+pnpm-lock.yaml          -diff
+yarn.lock               -diff
+
+# ---------- 导出文件 ----------
+*.html    text eol=lf diff=html
