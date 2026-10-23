@@ -17,11 +17,21 @@ from app.semantic.registry import SemanticRegistry
 from app.semantic.renderer import SQLRenderer, RenderError
 from app.semantic.timerange import DateRange, TimeRangeError, parse_range
 
-__all__ = ['QaAnswer', 'QaEngine', 'NeedsAgentError']
+__all__ = ['QaAnswer', 'QaEngine', 'NeedsAgentError', 'ClarifyUserError']
 
 
 class NeedsAgentError(Exception):
     """问题超出形态 A 的能力（需多步推理/归因）—— 上层转形态 B。"""
+
+
+class ClarifyUserError(Exception):
+    """需要用户澄清/引导的问题（docs/16 P2-3）—— 直接返回澄清文案，
+    **不**转形态 B：口径歧义交给 LLM 就是让它自选口径作答，违反
+    「歧义必报错不猜」的产品纪律；寒暄类走 Agent 则白烧配额。"""
+
+    def __init__(self, text: str):
+        super().__init__(text)
+        self.text = text
 
 
 @dataclass
@@ -44,6 +54,12 @@ _PRODUCTS_HINTS = ('哪个商品', '哪款', '各商品', '商品拆解', '分�
 _WEEKLY_HINTS = ('每周', '周对比', '各周', '按周')
 _ANOMALY_HINTS = ('哪天', '异常', '波动', '突然', '峰值')
 
+# 寒暄/无关意图（docs/16 P2-3 轻量兜底）：短且命中寒暄词的提问
+# 不进 KeyError→Agent 路径白烧配额，直接给引导文案。
+_CHITCHAT_HINTS = ('你好', '您好', '在吗', '你是谁', '你会什么', '能做什么',
+                   '谢谢', '多谢', '辛苦', '再见', '拜拜', 'hi', 'hello',
+                   '帮助', '怎么用', '使用说明')
+
 
 class QaEngine:
     """查数式问答。所有计算走既有确定性组件，绝不调 LLM。"""
@@ -56,10 +72,23 @@ class QaEngine:
     # ------------------------------------------------------------------
 
     def answer(self, question: str) -> QaAnswer:
-        """回答一个查数类问题。超出能力抛 NeedsAgentError。"""
+        """回答一个查数类问题。超出能力抛 NeedsAgentError。
+
+        口径歧义 / 寒暄类抛 ClarifyUserError（直接澄清，不进 Agent）。
+        """
         q = (question or '').strip()
         if not q:
             raise NeedsAgentError('空问题')
+
+        # 寒暄/使用引导（docs/16 P2-3）：短问句且命中寒暄词 → 直接引导，
+        # 不烧 Agent 配额。真正的数据问题不会命中（含指标词/数字/时间）。
+        ql = q.lower()
+        if len(q) <= 20 and any(h in ql for h in _CHITCHAT_HINTS):
+            raise ClarifyUserError(
+                '你好！我是店铺经营分析助手，基于你上传的千牛报表回答问题：\n'
+                '· 查数：「这个月毛利率多少」「上周退款率」「哪个商品退款率高」\n'
+                '· 归因：「为什么这周退款变多」「帮我看看利润下滑的原因」\n'
+                '先在「数据上传」页导入报表并完成一次诊断，就可以开始提问。')
 
         # 归因/建议类 → 形态 B
         if any(k in q for k in _WHY_KEYWORDS):
@@ -115,11 +144,13 @@ class QaEngine:
         try:
             metric = self.reg.resolve(probe or q)
         except CaliberConflict as e:
-            # 真歧义 → 也交给 B？不 —— 口径歧义是产品纪律，提示用户明确
+            # ★ docs/16 P2-3：口径歧义必须让用户明确 —— 绝不转形态 B
+            #   让 LLM 自选口径作答（违反「歧义必报错不猜」）。
             cands = '、'.join(e.candidates)
-            raise NeedsAgentError(
-                f'「{probe}」命中多个口径：{cands}。请明确指定，'
-                f'或直接问"为什么"类问题让我（Agent）帮你分析。')
+            raise ClarifyUserError(
+                f'「{probe}」命中多个口径：{cands}。\n'
+                f'请指明其一再问（例如带上「财务口径」「推广口径」等字样），'
+                f'我不猜口径 —— 两种口径的数字可能差很多。')
         except KeyError:
             raise NeedsAgentError(f'没有从问题里识别出指标：{probe!r}')
 
@@ -186,10 +217,12 @@ class QaEngine:
         lines = []
         for x in weeks:
             cvr = f"{x['pay_cvr'] * 100:.2f}%" if x.get('pay_cvr') is not None else '—'
+            rr = (f"{x['refund_rate'] * 100:.1f}%"
+                  if x.get('refund_rate') is not None else '—')
             days = f"（{x['days']}天，不完整）" if (x.get('days') or 7) < 7 else ''
             lines.append(f"· {x['label'][5:]} 起{days}：访客 {x['visitors']:,}，"
                          f"转化率 {cvr}，净销售额 ¥{x['net_sales']:,.0f}，"
-                         f"退款率 {x['refund_rate'] * 100:.1f}%")
+                         f"退款率 {rr}")
         big = w.get('biggest')
         if big:
             k = big['kind']

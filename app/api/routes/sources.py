@@ -47,7 +47,7 @@ async def upload_source(ctx: Ctx, request: Request,
                         file: UploadFile = File(...)):
     """上传千牛导出文件。
 
-    支持 .xlsx / .xls / .csv。文件大小与类型在服务端二次校验。
+    支持 .xlsx / .csv（.xls 请先另存为 .xlsx）。文件大小与类型在服务端二次校验。
     **文件名由服务端生成**，不使用客户端文件名（防路径穿越）。
 
     ★ **多工作表自动拆分**：一个含多张报表的 Excel（如样例数据）

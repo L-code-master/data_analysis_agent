@@ -672,6 +672,13 @@ def run_diagnosis(tenant_id: str, user_id: str,
                 warns.extend(q.warnings)
             except (RenderError, CaliberConflict) as e:
                 warns.append(f'{mid} 计算失败: {e}')
+            except Exception as e:                       # noqa: BLE001
+                # ★ docs/16 P2-5：单指标的 DuckDB/数据错误只降级该指标
+                #   （记入报告「计算提示」），不能炸掉整个诊断 ——
+                #   否则一个坏指标让其余 8 个全丢，与趋势/商品区块的
+                #   降级纪律一致。
+                logger.exception('指标计算失败 metric=%s', mid)
+                warns.append(f'{mid} 计算失败: {type(e).__name__}: {e}')
 
         emit('reporting', '生成报告')
 

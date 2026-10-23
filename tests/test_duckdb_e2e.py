@@ -353,6 +353,36 @@ warn = c3.execute(
 assert_eq('缺批次已落 ETL 错误表（WARN）', warn, 1)
 
 # ===========================================================================
+print('\n[7b] ★ WAC 分子分母同源过滤（docs/16 P2-6：缺金额批次不稀释成本）')
+c3b = duckdb.connect(':memory:')
+c3b.execute((ROOT / 'semantic' / 'schema.sql').read_text(encoding='utf-8'))
+c3b.execute("""
+INSERT INTO stg_trade_orders
+ (order_id, sub_order_id, create_time, pay_time, ship_time, confirm_time,
+  order_status, refund_status, buyer_nick, item_id, item_title, merchant_code,
+  sku_id, sku_props, price, quantity, pay_amount, goods_amount, shipping_fee,
+  discount, seller_income, receiver_province) VALUES
+ ('TB901','TB901-1','2026-10-01 10:00:00','2026-10-01 10:05:00','2026-10-01 18:00:00',
+  '2026-10-04 12:00:00','交易成功','无退款','b','ITEM-Y','同源过滤商品','MC-Y',
+  'SKU-Y','蓝;L',100.0,10,1000.0,1000.0,0.0,0.0,1000.0,'浙江');
+-- 一个正常批次（100 件 × ¥10）+ 一个缺金额批次（100 件 unit_cost NULL）：
+-- 修复前 WAC = 1000/200 = 5（分母被稀释）；同源过滤后 = 10
+INSERT INTO stg_purchase_batches
+ (batch_id, merchant_code, item_id, purchase_date, arrival_date, quantity,
+  unit_cost, freight_total, other_cost, supplier, currency) VALUES
+ ('BY1','MC-Y','ITEM-Y','2026-09-01','2026-09-10',100,10.0,0.0,0.0,'s','CNY'),
+ ('BY2','MC-Y','ITEM-Y','2026-09-05','2026-09-12',100,NULL,0.0,0.0,'s','CNY');
+""")
+c3b.execute(s5)
+cogs_y = c3b.execute(
+    "SELECT cogs FROM v_profit_daily WHERE item_id = 'ITEM-Y'").fetchone()[0]
+assert_eq('★ WAC 不被缺金额批次稀释（10 件 × ¥10 = 100）', cogs_y, 100.0)
+bad_batch = c3b.execute(
+    "SELECT COUNT(*) FROM dwd_etl_errors "
+    "WHERE error_code = 'BAD_BATCH_AMOUNT'").fetchone()[0]
+assert_eq('★ 缺金额批次落 BAD_BATCH_AMOUNT 提示', bad_batch, 1)
+
+# ===========================================================================
 print('\n[8] ★ 语义层版本化迁移（docs/16 P1-12）')
 from app.services.semantic_admin import (                   # noqa: E402
     SEMANTIC_SCHEMA_VERSION as EXPECTED_SEM_VERSION,
@@ -370,7 +400,7 @@ c4.execute("UPDATE sem_metric_registry SET metric_spec = "
 c4.execute("INSERT INTO sem_metric_dimension VALUES "
            "('M01','source_channel',NULL,NULL,1)")
 ver = migrate_semantic_db(c4)
-check_ver = ver == SEMANTIC_SCHEMA_VERSION == 4
+check_ver = ver == SEMANTIC_SCHEMA_VERSION == 5
 print(f'    [{"PASS" if check_ver else "FAIL"}] 迁移到 v{ver}')
 if not check_ver:
     fails.append('语义层版本')

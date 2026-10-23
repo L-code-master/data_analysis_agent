@@ -93,7 +93,7 @@ def open_semantic_db(tenant_id: str):
 # 新增修订时：① 把改动写进 schema.sql（新库直接是最新口径）；
 # ② 在 SEMANTIC_MIGRATIONS 追加一条（旧库按版本补丁）；
 # ③ 提升 SEMANTIC_SCHEMA_VERSION 与 schema.sql 的种子版本。
-SEMANTIC_SCHEMA_VERSION = 4
+SEMANTIC_SCHEMA_VERSION = 5
 
 # 流量指标统一口径（与 schema.sql S5.1 的归一化、S7 的 metric_spec 对齐）
 _TRAFFIC_BASE_FILTER = {'stat_scope': 'SHOP', 'source_channel': 'TOTAL'}
@@ -126,9 +126,13 @@ _PROFIT_DAILY_VIEW_SQL = """CREATE OR REPLACE VIEW v_profit_daily AS
        SELECT stat_date, SUM(net_sales) AS day_net_sales
        FROM v_sales_daily GROUP BY 1
    ), wac AS (
+       -- ★ 分子分母同源（docs/16 P2-6）：SUM 跳过 NULL 行，不过滤的话
+       --   缺金额批次的数量仍计入分母，WAC 被稀释偏低。
        SELECT merchant_code,
               SUM(total_unit_cost * quantity) / NULLIF(SUM(quantity), 0) AS wac
-       FROM dwd_cost_batch GROUP BY merchant_code
+       FROM dwd_cost_batch
+       WHERE total_unit_cost IS NOT NULL AND quantity > 0
+       GROUP BY merchant_code
    ), fees AS (
        SELECT posted_date AS d,
               SUM(CASE WHEN fee_category = 'COMMISSION' THEN amount ELSE 0 END) AS commission,
@@ -227,11 +231,17 @@ def _mig_v4(con) -> None:
         "WHERE metric_id = 'M01' AND dimension_name = 'source_channel'")
 
 
+def _mig_v5(con) -> None:
+    """v5：WAC 分子分母同源过滤（P2-6）—— 缺金额批次不再稀释加权成本。"""
+    con.execute(_PROFIT_DAILY_VIEW_SQL)
+
+
 SEMANTIC_MIGRATIONS: list[tuple[int, str, Callable[[Any], None]]] = [
     (1, '退款原因最长前缀匹配', _mig_v1),
     (2, '广告费按净销售占比分摊（P0-4）', _mig_v2),
     (3, '移除 M17 维度白名单（P0-5）', _mig_v3),
     (4, 'COGS 缺批次保留 NULL + 流量口径 base_filter（P1-8/P1-9）', _mig_v4),
+    (5, 'WAC 分子分母同源过滤（P2-6）', _mig_v5),
 ]
 
 

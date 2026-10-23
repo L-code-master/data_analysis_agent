@@ -148,6 +148,31 @@ for s in sources:
 check('★ 全部数据源无需人工确认', len(needs_confirm) == 0, needs_confirm)
 
 # ===========================================================================
+print('\n[5b] CSV 闭环（docs/16 P2-4：单 BOM，列匹配不降级）')
+_bom = b'\xef\xbb\xbf'
+for name, content in files:
+    check(f'{name} 仅一个 BOM',
+          content.startswith(_bom) and not content[3:].startswith(_bom))
+
+r = client.post('/api/v1/auth/register', json={
+    'email': f'csv{int(time.time())}@shop.com',
+    'password': 'CsvTest!2026', 'tenant_name': 'CSV 店'})
+check('CSV 店注册 201', r.status_code == 201, r.status_code)
+CH = {'Authorization': f'Bearer {r.json()["token"]["access_token"]}'}
+r = client.post('/api/v1/sources', headers=CH,
+                files={'file': ('订单明细.csv', files[0][1], 'text/csv')})
+check('CSV 上传 201', r.status_code == 201, r.status_code)
+csv_src = r.json()[0]
+r = client.get(f'/api/v1/sources/{csv_src["source_id"]}/profile', headers=CH)
+check('CSV 画像 200', r.status_code == 200, r.status_code)
+prof = r.json()
+# 双 BOM 时代首列 '订单编号' 带 U+FEFF 前缀 → 匹配降级 → needs_confirmation
+check('★ CSV 无缺失必填字段', prof['missing_required'] == [],
+      prof.get('missing_required'))
+check('★ CSV 无需人工确认（BOM 不再破坏首列匹配）',
+      prof['needs_confirmation'] is False)
+
+# ===========================================================================
 print('\n[6] 发起诊断（用全部 6 个数据源）')
 ids = [s['source_id'] for s in sources]
 r = client.post('/api/v1/diagnoses', headers=H,

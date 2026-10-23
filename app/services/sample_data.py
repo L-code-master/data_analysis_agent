@@ -230,7 +230,10 @@ def _csv_bytes(rows: list[list], header: list[str]) -> bytes:
     w = csv.writer(buf)
     w.writerow(header)
     w.writerows(rows)
-    return ('\ufeff' + buf.getvalue()).encode('utf-8-sig')
+    # \u2605 docs/16 P2-4\uff1autf-8-sig \u7f16\u7801\u81ea\u5e26\u4e00\u4e2a BOM \u2014\u2014 \u539f\u5148\u518d\u624b\u5de5\u62fc
+    #   '\ufeff' \u4f1a\u4ea7\u51fa\u53cc BOM\uff0c\u9996\u5217\u540d\u53d8\u6210 '\ufeff\u8ba2\u5355\u7f16\u53f7'\uff0c\u5217\u5339\u914d
+    #   \u964d\u7ea7\u89e6\u53d1\u4eba\u5de5\u786e\u8ba4\u3002
+    return buf.getvalue().encode('utf-8-sig')
 
 
 def build_files() -> list[tuple[str, bytes]]:

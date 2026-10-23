@@ -435,6 +435,9 @@ CREATE TABLE IF NOT EXISTS sem_schema_version (
     applied_at   TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 INSERT INTO sem_schema_version (version, description)
+SELECT 5, 'v1.5 COGS 不静默兜底 + 流量口径过滤 + M17 维度限制 + 广告费分摊 + WAC 同源过滤'
+WHERE NOT EXISTS (SELECT 1 FROM sem_schema_version WHERE version = 5);
+INSERT INTO sem_schema_version (version, description)
 SELECT 4, 'v1.5 COGS 不静默兜底 + 流量口径过滤 + M17 维度限制 + 广告费分摊'
 WHERE NOT EXISTS (SELECT 1 FROM sem_schema_version WHERE version = 4);
 
@@ -583,6 +586,16 @@ SELECT 'E' || (200 + ROW_NUMBER() OVER ()), 'v1-full-refresh', 'dwd_cost_batch',
        'stg_purchase_batches', batch_id, CURRENT_TIMESTAMP
 FROM stg_purchase_batches WHERE merchant_code IS NULL OR merchant_code = '';
 
+-- S5.6c 成本批次缺金额/数量异常（docs/16 P2-6：该批次不计入加权平均，
+-- 必须提示而非静默 —— WAC 分母不再被异常批次稀释）
+INSERT INTO dwd_etl_errors
+SELECT 'E' || (250 + ROW_NUMBER() OVER ()), 'v1-full-refresh', 'dwd_cost_batch', 'WARN',
+       'BAD_BATCH_AMOUNT',
+       '成本批次金额缺失或数量异常（不计入加权平均成本）: ' || batch_id,
+       'stg_purchase_batches', batch_id, CURRENT_TIMESTAMP
+FROM stg_purchase_batches
+WHERE unit_cost IS NULL OR quantity IS NULL OR quantity <= 0;
+
 -- S5.7 库存
 DELETE FROM dwd_inventory_snapshot;
 INSERT INTO dwd_inventory_snapshot
@@ -694,9 +707,14 @@ WITH sales AS (
     FROM v_sales_daily GROUP BY 1
 ), wac AS (
     -- 移动加权单位成本（按商家编码）
+    -- ★ 分子分母必须同源（docs/16 P2-6）：SUM 自动跳过 NULL 行，若不过滤，
+    --   缺金额批次的数量仍计入分母 —— WAC 被稀释偏低、毛利虚高。
+    --   缺金额/异常数量的批次不计入加权平均（S5.6c 落 WARN 提示）。
     SELECT merchant_code,
            SUM(total_unit_cost * quantity) / NULLIF(SUM(quantity), 0) AS wac
-    FROM dwd_cost_batch GROUP BY merchant_code
+    FROM dwd_cost_batch
+    WHERE total_unit_cost IS NOT NULL AND quantity > 0
+    GROUP BY merchant_code
 ), fees AS (
     -- 账房费用按日聚合（按类别）
     SELECT posted_date AS d,

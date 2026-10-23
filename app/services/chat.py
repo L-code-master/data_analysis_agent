@@ -16,7 +16,9 @@ from app.storage import db
 from app.services.agent_engine import AgentEngine, build_tools
 from app.services.llm_client import LlmClient
 from app.services import billing, locks
-from app.services.qa_engine import NeedsAgentError, QaAnswer, QaEngine
+from app.services.qa_engine import (
+    ClarifyUserError, NeedsAgentError, QaAnswer, QaEngine,
+)
 from app.semantic.registry import SemanticRegistry
 from app.services.semantic_admin import open_semantic_db
 
@@ -68,12 +70,19 @@ def get_session(tenant_id: str, session_id: str) -> dict | None:
 
 
 def list_messages(tenant_id: str, session_id: str, limit: int = 100) -> list[dict]:
+    """按时间序返回**最近** N 条消息。
+
+    ★ docs/16 P2-1：升序 + LIMIT 取到的是「最旧 N 条」—— 长会话时
+      Agent 拿到的历史与最近上下文完全错位，且调用方 `[:-1]` 会错删
+      窗口内最后一条。改为 DESC 取最近 N 条再反转回时间序。
+    """
     with db.get_conn() as conn:
         rows = conn.execute(
             'SELECT id,role,content,route,meta,created_at FROM chat_messages '
             'WHERE session_id = ? AND tenant_id = ? '
-            'ORDER BY created_at LIMIT ?',
+            'ORDER BY created_at DESC LIMIT ?',
             (session_id, tenant_id, int(limit))).fetchall()
+    rows = list(reversed(rows))
     out = []
     for r in rows:
         meta = {}
@@ -88,6 +97,23 @@ def list_messages(tenant_id: str, session_id: str, limit: int = 100) -> list[dic
                     'meta': meta,
                     'created_at': _rg(r, 'created_at', 5)})
     return out
+
+
+def _finalize_message(message_id: str, session_id: str, tenant_id: str,
+                      content: str, route: str, meta: dict | None = None) -> None:
+    """把配额占位消息（agent_reserved）改写为最终回答（docs/16 P2-12）。"""
+    with db.transaction() as conn:
+        cur = conn.execute(
+            'UPDATE chat_messages SET content = ?, route = ?, meta = ? '
+            'WHERE id = ? AND session_id = ? AND tenant_id = ?',
+            (content, route, json.dumps(meta or {}, ensure_ascii=False),
+             message_id, session_id, tenant_id))
+        if not cur.rowcount:       # 占位行丢失（理论不可达）→ 兜底插入
+            conn.execute(
+                'INSERT INTO chat_messages (id,session_id,tenant_id,role,'
+                'content,route,meta,created_at) VALUES (?,?,?,?,?,?,?,?)',
+                (message_id, session_id, tenant_id, 'assistant', content,
+                 route, json.dumps(meta or {}, ensure_ascii=False), _now()))
 
 
 def _save_message(session_id: str, tenant_id: str, role: str, content: str,
@@ -194,14 +220,16 @@ def agent_chat_quota(tenant_id: str) -> tuple[int, int]:
     """返回 (配额, 已用)。配额 -1 = 不限。
 
     配额 =（购买 + 赠送获得的诊断次数）× AGENT_CHATS_PER_CREDIT；
-    已用 = 该租户 route='agent' 的回答条数（agent_error 不计 —— 失败不收费）。
+    已用 = 该租户 route='agent' / 'agent_reserved' 的回答条数
+    （agent_error 不计 —— 失败不收费；reserved 是并发下的占位，
+    防止「先查后写」超卖，见 docs/16 P2-12）。
     """
     s = get_settings()
     per = s.agent_chats_per_credit
     with db.get_conn() as conn:
         used = conn.execute(
             "SELECT COUNT(*) FROM chat_messages "
-            "WHERE tenant_id = ? AND route = 'agent'",
+            "WHERE tenant_id = ? AND route IN ('agent', 'agent_reserved')",
             (tenant_id,)).fetchone()[0]
     if per <= 0:
         return -1, int(used)
@@ -267,11 +295,20 @@ def ask(tenant_id: str, user_id: str, session_id: str,
                 a: QaAnswer = qa.answer(question)
                 _save_message(session_id, tenant_id, 'user', question)
                 _save_message(session_id, tenant_id, 'assistant', a.text,
-                              route='qa', meta=a.meta)
-                return {'answer': a.text, 'route': 'qa', 'meta': a.meta}
+                              route=a.route or 'qa', meta=a.meta)
+                return {'answer': a.text, 'route': a.route or 'qa',
+                        'meta': a.meta}
+            except ClarifyUserError as cue:
+                # ★ docs/16 P2-3：口径歧义/寒暄直接澄清，不进 Agent
+                #   （不让 LLM 自选口径，也不为寒暄烧配额）。
+                _save_message(session_id, tenant_id, 'user', question)
+                _save_message(session_id, tenant_id, 'assistant', cue.text,
+                              route='clarify')
+                return {'answer': cue.text, 'route': 'clarify', 'meta': {}}
             except NeedsAgentError as reason:
                 # ---- 配额检查（admin 不受限；被拒不落库）----
-                if not _is_admin_user(user_id):
+                is_admin = _is_admin_user(user_id)
+                if not is_admin:
                     quota, used = agent_chat_quota(tenant_id)
                     if quota >= 0 and used >= quota:
                         raise AgentQuotaExceededError(quota, used)
@@ -290,9 +327,25 @@ def ask(tenant_id: str, user_id: str, session_id: str,
                 if not ok:
                     raise CostQuotaExceededError(cost_reason)
 
+                # ★ docs/16 P2-12：所有会 return/raise 的检查都已通过，
+                #   落配额占位消息再放锁 —— 否则并发两问都读到同一
+                #   used 值双双放行，配额形同虚设。占位行 route=
+                #   'agent_reserved' 计入已用，结束时改写为最终回答
+                #   （失败则 agent_error，不收费）。
+                reserved_mid = ''
+                if not is_admin:
+                    reserved_mid = _save_message(
+                        session_id, tenant_id, 'assistant', '（分析中…）',
+                        route='agent_reserved')
+
                 _save_message(session_id, tenant_id, 'user', question)
+                # 末尾是「刚落的用户问题（+ 占位行）」：question 单独传给
+                # 引擎，历史里要排除，避免重复（docs/16 P2-1 修复后这里
+                # 拿到的已是「最近 N 条」时间序）。
+                msgs = list_messages(tenant_id, session_id)
+                drop_tail = 2 if reserved_mid else 1
                 history = [{'role': m['role'], 'content': m['content']}
-                           for m in list_messages(tenant_id, session_id)[:-1]
+                           for m in msgs[:-drop_tail]
                            if m['role'] in ('user', 'assistant')]
         finally:
             try:
@@ -327,8 +380,15 @@ def ask(tenant_id: str, user_id: str, session_id: str,
     spec, impl = build_tools(reg, con_getter)
     impl = {name: _locked(fn) for name, fn in impl.items()}
     engine = AgentEngine(LlmClient(), tenant_id, spec, impl)
-    res = engine.run(question, history=history,
-                     data_context=_data_context_prompt(ctx))
+    try:
+        res = engine.run(question, history=history,
+                         data_context=_data_context_prompt(ctx))
+    except Exception as e:                        # noqa: BLE001
+        # 占位行不能永远停在「分析中…」（docs/16 P2-12）：改写为失败态后照常抛出
+        if reserved_mid:
+            _finalize_message(reserved_mid, session_id, tenant_id,
+                              f'分析失败：{e}', 'agent_error')
+        raise
 
     if res.error and not res.answer:
         text = f'分析失败：{res.error}'
@@ -345,6 +405,11 @@ def ask(tenant_id: str, user_id: str, session_id: str,
                 'files': ctx.get('files', []),
                 'time_range': ctx.get('time_range', ''),
             } if ctx.get('available') else {}}
-    _save_message(session_id, tenant_id, 'assistant', text,
-                  route=route, meta=meta)
+    if reserved_mid:
+        # ★ docs/16 P2-12：改写占位行为最终回答（占位已计入配额）
+        _finalize_message(reserved_mid, session_id, tenant_id,
+                          text, route, meta)
+    else:
+        _save_message(session_id, tenant_id, 'assistant', text,
+                      route=route, meta=meta)
     return {'answer': text, 'route': route, 'meta': meta}

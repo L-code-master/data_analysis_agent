@@ -208,10 +208,16 @@ def build_tools(reg, con_getter) -> tuple[list[dict], dict]:
         weeks = w.get('weeks') or []
         if not weeks:
             return '无周度数据'
-        out = [f"{x['label'][5:]}起({x.get('days', 7)}天): 访客{x['visitors']:,} "
-               f"净销¥{x['net_sales']:,.0f} 退款率{x['refund_rate'] * 100:.1f}% "
-               f"ROI{x.get('roi') if x.get('roi') is not None else '—'}"
-               for x in weeks]
+
+        def _row(x: dict) -> str:
+            rr = (f"{x['refund_rate'] * 100:.1f}%"
+                  if x.get('refund_rate') is not None else '—')   # P2-9: pay=0 → None
+            roi = x.get('roi') if x.get('roi') is not None else '—'
+            return (f"{x['label'][5:]}起({x.get('days', 7)}天): "
+                    f"访客{x['visitors']:,} 净销¥{x['net_sales']:,.0f} "
+                    f"退款率{rr} ROI{roi}")
+
+        out = [_row(x) for x in weeks]
         big = w.get('biggest')
         if big:
             out.append(f"变化最大: {big['metric']} 末周{big['last']} vs 均{big['base']}"
@@ -244,6 +250,20 @@ SYSTEM_PROMPT = '''你是淘宝店铺的经营分析助手。数据已由用户�
 3. 工具返回"无数据"时如实告知，不要猜。
 4. 回答末尾注明关键口径（工具结果里带"口径："的都要转达）。
 5. 回答用中文，简洁、直接给结论，再给依据。适合淘宝卖家阅读。'''
+
+
+# L4 紧急压缩触发词（docs/16 P2-2）：不同网关对上下文超限的报错
+# 措辞不一，按关键词识别；命中后 compress_reactive 压缩并重试一次。
+_CONTEXT_OVERFLOW_MARKERS = (
+    'context_length', 'context length', 'context window',
+    'maximum context', 'too many tokens', 'input too long',
+    'token limit', 'exceeds the context', 'prompt is too long',
+)
+
+
+def _is_context_overflow(err: Exception) -> bool:
+    text = str(err).lower()
+    return any(m in text for m in _CONTEXT_OVERFLOW_MARKERS)
 
 
 class AgentEngine:
@@ -308,6 +328,7 @@ class AgentEngine:
             return ''
 
         try:
+            reactive_tried = False          # L4 紧急压缩只重试一次（P2-2）
             for turn in range(self.max_turns):
                 res.turns = turn + 1
                 exceeded = budget_error()
@@ -325,8 +346,23 @@ class AgentEngine:
                                                'level': cr.level,
                                                'events': cr.events[:3]})
 
-                resp = self.client.chat(messages, tools=self.tools_spec,
-                                        temperature=0.2)
+                try:
+                    resp = self.client.chat(messages, tools=self.tools_spec,
+                                            temperature=0.2)
+                except LlmError as e:
+                    # ★ docs/16 P2-2：L4 紧急压缩此前零调用方 —— 上下文
+                    #   超限直接整轮失败。现在命中超限报错就激进压缩后
+                    #   重试一次（仍失败才放弃）。
+                    if not reactive_tried and _is_context_overflow(e):
+                        reactive_tried = True
+                        cr = self.compressor.compress_reactive(messages,
+                                                               error=e)
+                        messages = cr.messages
+                        res.tool_trace.append(
+                            {'tool': '_compress', 'level': cr.level,
+                             'events': cr.events[:3]})
+                        continue
+                    raise
                 self._record_usage(res, resp)
 
                 if not resp.wants_tool:
@@ -363,7 +399,7 @@ class AgentEngine:
                         res.guard_warnings = guard.warnings
                         return res
                     res.tool_trace.append({'tool': call['name'],
-                                           'args': call['arguments'][:200],
+                                           'args': (call['arguments'] or '')[:200],
                                            'result': result_text[:300]})
                     messages.append({'role': 'tool',
                                      'tool_call_id': call['id'],

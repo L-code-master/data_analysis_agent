@@ -91,13 +91,15 @@ _PUNCT_RE = re.compile(r'[（）()【】\[\]：:，,。.、/／\-_*]')
 
 
 def normalize_column(name: Any) -> str:
-    """列名归一化：去空白、去标点、转小写、全角转半角。
+    """列名归一化：去 BOM、去空白、去标点、转小写、全角转半角。
 
     这样 "支付金额（元）" 与 "支付金额(元)" 与 " 支付金额 " 都能匹配上。
     """
     if name is None:
         return ''
-    s = str(name).strip()
+    # ★ docs/16 P2-4：BOM 可能藏在首列名开头（双 BOM 的 CSV / 某些导出），
+    #   strip() 不吃 U+FEFF —— 不剥掉会让首列永远匹配不上。
+    s = str(name).strip().lstrip('﻿').strip()
     # 全角字母数字 → 半角
     s = ''.join(
         chr(ord(c) - 0xFEE0) if 0xFF01 <= ord(c) <= 0xFF5E else c
@@ -162,10 +164,12 @@ def read_file(path: Path, spec: SourceSpec | None = None,
             path, spec, sheet_name)
         encoding = ''
     elif suffix == '.xls':
-        headers, rows, sheet, hdr_idx, truncated = _read_excel(
-            path, spec, sheet_name)
-        encoding = ''
-        warnings.append('.xls 为旧格式，建议另存为 .xlsx 以获得更好的兼容性')
+        # ★ docs/16 P2-8：openpyxl 只支持 .xlsx/.xlsm —— .xls 走下面
+        #   必然在 openpyxl 内部抛晦涩错误。诚实下线：明确拒绝并给
+        #   出可操作的指引，而不是宣称支持却必失败。
+        raise ValueError(
+            '暂不支持 .xls 旧格式 —— 请用 Excel/WPS 打开后「另存为」'
+            '.xlsx 再上传（数据不会丢失）')
     elif suffix == '.csv':
         if sheet_name:
             raise ValueError('CSV 文件不支持指定工作表')
@@ -177,7 +181,7 @@ def read_file(path: Path, spec: SourceSpec | None = None,
     else:
         raise ValueError(
             f'不支持的文件类型: {suffix}。'
-            f'支持 .xlsx / .xls / .csv')
+            f'支持 .xlsx / .csv（.xls 请先另存为 .xlsx）')
 
     if truncated:
         warnings.append(
@@ -849,8 +853,8 @@ def prepare_all(path: Path) -> list[PreparedSource]:
     suffix = path.suffix.lower()
     sha = file_sha256(path)
 
-    if suffix not in ('.xlsx', '.xlsm', '.xls'):
-        p = prepare(path)
+    if suffix not in ('.xlsx', '.xlsm'):
+        p = prepare(path)          # .xls 在 read_file 里明确拒绝（P2-8）
         return [p] if p.spec is not None else []
 
     try:

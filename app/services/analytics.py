@@ -53,13 +53,16 @@ def build_trend(con, tr) -> list[dict]:
         return []
 
     tmap = {str(r[0]): (r[1] or 0, r[2] or 0) for r in traffic}
+    smap = {str(d): float(net or 0) for d, net in sales}
     out = []
-    for d, net in sales:
-        ds = str(d)
+    # ★ docs/16 P2-10：以「销售 ∪ 流量」日期并集为骨架 —— 只用销售日
+    #   会让零销售日整行缺失：访客被低估、异常检测对"掉到零"失明。
+    #   零销售日净销售额补 0。
+    for ds in sorted(set(smap) | set(tmap)):
         v, b = tmap.get(ds, (0, 0))
         out.append({
             'date': ds,
-            'net_sales': round(float(net or 0), 2),
+            'net_sales': round(smap.get(ds, 0.0), 2),
             'visitors': int(v),
             'pay_cvr': round(b / v, 4) if v else None,
         })
@@ -270,19 +273,22 @@ def build_weekly_compare(con, tr) -> dict:
             'net_sales': round(float(net or 0), 2),
             'visitors': int(vis or 0),
             'pay_cvr': round((buyers / vis), 4) if vis else None,
-            'refund_rate': round(float(refund or 0) / float(pay or 1), 4),
+            # ★ docs/16 P2-9：pay=0 时退款率没有意义，置 None ——
+            #   原先 `pay or 1` 会把退款算成 50000% 之类的天文数字。
+            'refund_rate': (round(float(refund or 0) / float(pay), 4)
+                            if pay else None),
             'ad_spend': round(spend, 2),
             'roi': round(float(net or 0) / spend, 2) if spend else None,
         })
     if len(weeks) < 2:
         return {'weeks': weeks, 'biggest': None}
 
-    # 变化最大的维度：末个完整周 vs 之前完整周均值（残周数据不完整，不参与）
+    # 变化最大的维度：仅完整周（days ≥ 7）参与 —— 残周数据不完整，
+    # 注释一直说"不参与"，原先回退分支却让它参与了（docs/16 P2-9）。
     full = [w for w in weeks if w['days'] >= 7]
-    if len(full) >= 2:
-        last, prev = full[-1], full[:-1]
-    else:
-        last, prev = weeks[-1], weeks[:-1]
+    if len(full) < 2:
+        return {'weeks': weeks, 'biggest': None}
+    last, prev = full[-1], full[:-1]
 
     def _avg(key):
         vals = [w[key] for w in prev if w.get(key) is not None]

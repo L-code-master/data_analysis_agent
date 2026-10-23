@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import datetime as dt
 import logging
+import sqlite3
 import uuid
 from dataclasses import dataclass
 from typing import Any
@@ -380,11 +381,13 @@ def create_order(tenant_id: str, sku: str, user_id: str = '') -> Order:
                 ' VALUES (?,?,?,?,?,?,?,?,?,?,?,?)',
                 (order_id, tenant_id, user_id or None, order_no, sku, quantity,
                  amount, 'CNY', 'pending', s.billing_provider, now, now))
-    except Exception as e:
-        # 唯一索引拦截重复体验价
-        if 'trial' in str(e).lower() or 'UNIQUE' in str(e).upper():
+    except sqlite3.IntegrityError as e:
+        # ★ docs/16 P2-11：只有「体验价限购」索引（idx_orders_trial_once）
+        #   的冲突才定性为限购。原先按 'trial'/'UNIQUE' 子串匹配，任何
+        #   唯一冲突（如订单号碰撞）都会被误报成"体验价限购一次"。
+        if sku == 'trial' and 'idx_orders_trial_once' in str(e):
             raise TrialAlreadyUsedError() from e
-        raise
+        raise BillingError(f'订单创建失败：{e}', 'ORDER_CREATE_FAILED') from e
 
     return Order(id=order_id, order_no=order_no, tenant_id=tenant_id, sku=sku,
                  quantity=quantity, amount_cents=amount, status='pending',
@@ -489,12 +492,20 @@ def mark_paid(order_no: str, *, provider_trade_no: str = '',
              pay_proof_ref or None, now, oid))
 
         # ---- 额度入账（用条件 UPDATE 保证原子性）----
-        conn.execute(
+        cur = conn.execute(
             'UPDATE credit_accounts SET balance = balance + ?, '
             'total_purchased = total_purchased + ?, '
             'trial_used = CASE WHEN ? = ? THEN 1 ELSE trial_used END, '
             'updated_at = ? WHERE tenant_id = ?',
             (quantity, quantity, sku, 'trial', now, tenant_id))
+        if not cur.rowcount:
+            # ★ docs/16 P2-11：账户行缺失（数据异常）必须显式报错 ——
+            #   原先继续执行会在后续 _row_get(None) 上 TypeError 500。
+            #   抛错会连带回滚上面的订单 UPDATE，订单保持 pending，
+            #   修好账户后可重新核销。
+            raise BillingError(
+                f'额度账户不存在（tenant={tenant_id}），请联系客服核对账目',
+                'ACCOUNT_MISSING')
 
         # ★ 购买产生一个额度批次（5 次包 180 天，其余 365 天）
         lot_days = s.pack5_valid_days if sku == 'pack5' \

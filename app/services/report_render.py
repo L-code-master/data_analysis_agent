@@ -211,12 +211,15 @@ def _weekly_html(weekly: dict) -> str:
     for w in weeks:
         cvr = (f'{w["pay_cvr"] * 100:.2f}%' if w.get('pay_cvr') is not None else '—')
         roi = f'{w["roi"]:.1f}' if w.get('roi') is not None else '—'
+        # pay=0 的周退款率为 None（docs/16 P2-9），展示为 —
+        rr = (f'{w["refund_rate"] * 100:.2f}%'
+              if w.get('refund_rate') is not None else '—')
         rows.append(
             f'<tr><td class="mono">{_e(wk_label(w["label"], w.get("days", 7)))}</td>'
             f'<td class="num">{w["visitors"]:,}</td>'
             f'<td class="num">{cvr}</td>'
             f'<td class="num">¥{w["net_sales"]:,.0f}</td>'
-            f'<td class="num">{w["refund_rate"] * 100:.2f}%</td>'
+            f'<td class="num">{rr}</td>'
             f'<td class="num">¥{w["ad_spend"]:,.0f}</td>'
             f'<td class="num">{roi}</td></tr>')
 

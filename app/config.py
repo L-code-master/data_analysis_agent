@@ -120,7 +120,7 @@ class Settings:
 
     # ---------------- 上传 ----------------
     max_upload_mb: int = 50
-    allowed_upload_ext: str = '.xlsx,.xls,.csv'
+    allowed_upload_ext: str = '.xlsx,.csv'    # .xls 不支持（docs/16 P2-8）
 
     # ---------------- 沙箱 ----------------
     sandbox_network_isolated: bool = True
@@ -227,7 +227,7 @@ class Settings:
             tenants_root=_get(env, 'TENANTS_ROOT', './tenants'),
 
             max_upload_mb=_get_int(env, 'MAX_UPLOAD_MB', 50),
-            allowed_upload_ext=_get(env, 'ALLOWED_UPLOAD_EXT', '.xlsx,.xls,.csv'),
+            allowed_upload_ext=_get(env, 'ALLOWED_UPLOAD_EXT', '.xlsx,.csv'),
 
             sandbox_network_isolated=_get_bool(env, 'SANDBOX_NETWORK_ISOLATED', True),
             sandbox_mode=_get(env, 'SANDBOX_MODE', 'accept'),

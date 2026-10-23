@@ -281,6 +281,48 @@ r = client.post(f'/api/v1/chat/sessions/{SID}/ask', headers=H,
                 params={'question': '毛利率多少'})
 check('★ 旧 query 方式不再接受（422）', r.status_code == 422, r.status_code)
 
+# ---------------------------------------------------------------------------
+print('\n[11] P2-1/P2-3：历史窗口取最近 N 条 + 歧义/寒暄直接澄清')
+from app.services import chat as _chat2                       # noqa: E402
+
+# P2-1：升序 LIMIT 曾取到「最旧 100 条」—— 长会话时 Agent 历史完全错位
+_s = _chat2.create_session(TENANT_ID, title='长会话')
+import uuid as _u2                                          # noqa: E402
+import datetime as _dt2                                    # noqa: E402
+with _db.transaction() as _c:
+    for _i in range(120):
+        _c.execute(
+            'INSERT INTO chat_messages (id,session_id,tenant_id,role,content,'
+            'route,meta,created_at) VALUES (?,?,?,?,?,?,?,?)',
+            (_u2.uuid4().hex, _s['session_id'], TENANT_ID, 'user',
+             f'消息{_i}', 'qa', '{}',
+             (_dt2.datetime(2026, 1, 1, tzinfo=_dt2.timezone.utc)
+              + _dt2.timedelta(minutes=_i)).isoformat()))
+msgs = _chat2.list_messages(TENANT_ID, _s['session_id'])
+check('★ 长会话返回 100 条', len(msgs) == 100, len(msgs))
+check('★ 窗口是最新一段（末条=消息119）',
+      msgs[-1]['content'] == '消息119', msgs[-1]['content'])
+check('★ 窗口起点=消息20（不是消息0）',
+      msgs[0]['content'] == '消息20', msgs[0]['content'])
+
+# P2-3：口径歧义 → clarify（不进 Agent、不烧配额、不让 LLM 自选口径）
+# 问句同时包含 M03 的别名「支付转化率」与 M04 的「下单转化率」→ CaliberConflict
+r = client.post(f'/api/v1/chat/sessions/{SID}/ask', headers=H,
+                json={'question': '支付转化率和下单转化率有什么区别'})
+check('★ 歧义问题 route=clarify',
+      r.status_code == 200 and r.json().get('route') == 'clarify',
+      f'{r.status_code}/{r.json().get("route") if r.status_code == 200 else r.text[:60]}')
+check('★ 澄清文案列出候选口径',
+      'M03' in r.json().get('answer', '') and 'M04' in r.json().get('answer', ''),
+      r.json().get('answer', '')[:80])
+
+# P2-3：寒暄 → 直接引导（不进 Agent 烧配额）
+r = client.post(f'/api/v1/chat/sessions/{SID}/ask', headers=H,
+                json={'question': '你好'})
+check('★ 寒暄 route=clarify 引导',
+      r.status_code == 200 and r.json().get('route') == 'clarify',
+      f'{r.status_code}/{r.json().get("route") if r.status_code == 200 else r.text[:60]}')
+
 print()
 print('=' * 78)
 print('模块 11: ' + ('全部通过' if not fails else f'{len(fails)} 项失败 -> {fails}'))
