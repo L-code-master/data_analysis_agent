@@ -132,9 +132,9 @@ def build_tools(reg, con_getter) -> tuple[list[dict], dict]:
                 'required': []}}},
     ]
 
-    from app.services.diagnosis import (
-        _build_product_breakdown, _build_trend, _build_weekly_compare,
-        _detect_anomaly_days, _open_semantic_db,
+    from app.services.analytics import (
+        build_product_breakdown, build_trend, build_weekly_compare,
+        detect_anomaly_days,
     )
     from app.semantic.timerange import parse_range
 
@@ -159,7 +159,7 @@ def build_tools(reg, con_getter) -> tuple[list[dict], dict]:
     def _compute_metric(args: dict) -> str:
         from app.semantic.registry import SemanticRegistry
         from app.semantic.renderer import SQLRenderer
-        con = con_getter()            # _open_semantic_db 已按版本迁移
+        con = con_getter()            # open_semantic_db 已按版本迁移
         try:
             # ★ 复用 ask 作用域加载好的 registry（docs/16 P1-16）：
             #   指标定义与 metric_spec 都在内存里，不再每次工具调用重建。
@@ -187,7 +187,7 @@ def build_tools(reg, con_getter) -> tuple[list[dict], dict]:
             return f'计算失败：{e}'
 
     def _products(args: dict) -> str:
-        rows = _build_product_breakdown(con_getter(), _tr(args.get('time_range')))
+        rows = build_product_breakdown(con_getter(), _tr(args.get('time_range')))
         if not rows:
             return '无商品维度数据（需先上传订单数据）'
         out = []
@@ -204,7 +204,7 @@ def build_tools(reg, con_getter) -> tuple[list[dict], dict]:
         return '\n'.join(out)
 
     def _weekly(args: dict) -> str:
-        w = _build_weekly_compare(con_getter(), _tr(args.get('time_range')))
+        w = build_weekly_compare(con_getter(), _tr(args.get('time_range')))
         weeks = w.get('weeks') or []
         if not weeks:
             return '无周度数据'
@@ -219,8 +219,8 @@ def build_tools(reg, con_getter) -> tuple[list[dict], dict]:
         return '\n'.join(out)
 
     def _anomalies(args: dict) -> str:
-        trend = _build_trend(con_getter(), _tr(args.get('time_range')))
-        anoms = _detect_anomaly_days(trend)
+        trend = build_trend(con_getter(), _tr(args.get('time_range')))
+        anoms = detect_anomaly_days(trend)
         if not anoms:
             return '未检测到异常日'
         return '\n'.join(f"{a['date']}: {'；'.join(a['features'])} → {a['note']}"

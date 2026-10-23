@@ -18,7 +18,7 @@ from app.services.llm_client import LlmClient
 from app.services import billing, locks
 from app.services.qa_engine import NeedsAgentError, QaAnswer, QaEngine
 from app.semantic.registry import SemanticRegistry
-from app.services.diagnosis import _open_semantic_db
+from app.services.semantic_admin import open_semantic_db
 
 
 def _now() -> str:
@@ -255,8 +255,8 @@ def ask(tenant_id: str, user_id: str, session_id: str,
 
     # ---- 第一段（持租户锁）：语义层 + 形态 A ----
     with locks.tenant_lock(tenant_id):
-        # _open_semantic_db 已按版本迁移（只落后时执行一次，docs/16 P1-12/16）
-        con = _open_semantic_db(tenant_id)
+        # open_semantic_db 已按版本迁移（只落后时执行一次，docs/16 P1-12/16）
+        con = open_semantic_db(tenant_id)
         try:
             reg = SemanticRegistry(con)
             reg.load()
@@ -307,7 +307,7 @@ def ask(tenant_id: str, user_id: str, session_id: str,
     opened: list = []
 
     def con_getter():
-        c = _open_semantic_db(tenant_id)
+        c = open_semantic_db(tenant_id)
         opened.append(c)
         return c
 

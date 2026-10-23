@@ -264,8 +264,8 @@ assert_eq('★ M14 口径 2860/7000', m14, 2860.0 / 7000.0)
 
 # 升级补丁 U2 幂等重放后数字不变（存量租户库走这条路径拿到修复）
 sys.path.insert(0, str(ROOT))
-from app.services.diagnosis import _apply_semantic_upgrades   # noqa: E402
-_apply_semantic_upgrades(c2)
+from app.services.semantic_admin import apply_semantic_upgrades   # noqa: E402
+apply_semantic_upgrades(c2)
 tot_ad2 = c2.execute(
     'SELECT SUM(ad_spend) FROM v_profit_daily '
     "WHERE stat_date = DATE '2026-10-01'").fetchone()[0]
@@ -354,7 +354,11 @@ assert_eq('缺批次已落 ETL 错误表（WARN）', warn, 1)
 
 # ===========================================================================
 print('\n[8] ★ 语义层版本化迁移（docs/16 P1-12）')
-from app.services.diagnosis import _migrate_semantic_db, SEMANTIC_SCHEMA_VERSION  # noqa: E402
+from app.services.semantic_admin import (                   # noqa: E402
+    SEMANTIC_SCHEMA_VERSION as EXPECTED_SEM_VERSION,
+    migrate_semantic_db,
+)
+SEMANTIC_SCHEMA_VERSION = EXPECTED_SEM_VERSION
 
 # 模拟「存量旧库」：无版本记录 + 旧 metric_spec + 旧维度白名单
 c4 = duckdb.connect(':memory:')
@@ -365,7 +369,7 @@ c4.execute("UPDATE sem_metric_registry SET metric_spec = "
            "WHERE metric_id = 'M01'")
 c4.execute("INSERT INTO sem_metric_dimension VALUES "
            "('M01','source_channel',NULL,NULL,1)")
-ver = _migrate_semantic_db(c4)
+ver = migrate_semantic_db(c4)
 check_ver = ver == SEMANTIC_SCHEMA_VERSION == 4
 print(f'    [{"PASS" if check_ver else "FAIL"}] 迁移到 v{ver}')
 if not check_ver:
@@ -381,11 +385,38 @@ dim_left = c4.execute(
     "SELECT COUNT(*) FROM sem_metric_dimension "
     "WHERE metric_id='M01' AND dimension_name='source_channel'").fetchone()[0]
 assert_eq('M01 source_channel 维度已移除', dim_left, 0)
-ver2 = _migrate_semantic_db(c4)                   # 幂等重放
+ver2 = migrate_semantic_db(c4)                   # 幂等重放
 check_idem = ver2 == SEMANTIC_SCHEMA_VERSION
 print(f'    [{"PASS" if check_idem else "FAIL"}] 迁移幂等（重复调用无变化）')
 if not check_idem:
     fails.append('迁移幂等')
+
+# ===========================================================================
+print('\n[9] ★ schema.sql 锚点守护（docs/16 P2-26：命名分段加载）')
+from app.services import semantic_admin as _sem_admin    # noqa: E402
+
+_schema_all = (ROOT / 'semantic' / 'schema.sql').read_text(encoding='utf-8')
+for _name, (_a_start, _a_end) in _sem_admin._SCHEMA_SEGMENTS.items():
+    _ok = (_a_start in _schema_all
+           and (_a_end is None or _a_end in _schema_all)
+           and _schema_all.index(_a_start) < _schema_all.index(_a_end))
+    print(f'    [{"PASS" if _ok else "FAIL"}] 段「{_name}」锚点存在且有序')
+    if not _ok:
+        fails.append(f'锚点:{_name}')
+
+_seg_etl = _sem_admin.load_schema_segment('etl')
+check_seg = ('-- ===== S5 ETL' in _seg_etl
+             and '-- ===== S6 ' not in _seg_etl
+             and 'DELETE FROM' in _seg_etl.upper())
+print(f'    [{"PASS" if check_seg else "FAIL"}] etl 段内容正确且不含后续段锚点')
+if not check_seg:
+    fails.append('etl 段内容')
+_seg_qc = _sem_admin.load_schema_segment('quality')
+check_qc_seg = ('-- ===== S6.5' in _seg_qc
+                and '-- ===== S7' not in _seg_qc)
+print(f'    [{"PASS" if check_qc_seg else "FAIL"}] quality 段内容正确')
+if not check_qc_seg:
+    fails.append('quality 段内容')
 
 print()
 print('=' * 78)

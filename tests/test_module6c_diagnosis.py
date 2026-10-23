@@ -390,7 +390,8 @@ evil_data = {
     'caliber': {'registry_version': evil},
     'footnote': evil, 'warnings': [evil],
 }
-evil_html = dg._build_html(evil_data)
+from app.services.report_render import build_html    # noqa: E402
+evil_html = build_html(evil_data)
 check('★ 动态文本已转义（无原始 <img）', '<img' not in evil_html)
 check('★ 保留可见的转义文本', '&lt;img' in evil_html)
 check('★ 无 <script> 注入', '<script' not in evil_html.lower())

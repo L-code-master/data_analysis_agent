@@ -160,8 +160,8 @@ class QaEngine:
     # ---- 归因区块复用（v1.2 的确定性聚合，同一套数字）----
 
     def _answer_products(self, tr) -> QaAnswer:
-        from app.services.diagnosis import _build_product_breakdown
-        rows = _build_product_breakdown(self.con, tr)
+        from app.services.analytics import build_product_breakdown
+        rows = build_product_breakdown(self.con, tr)
         if not rows:
             return QaAnswer(text='当前没有商品维度的数据（需要已上传并诊断过订单数据）。')
         lines = []
@@ -178,8 +178,8 @@ class QaEngine:
                         meta={'kind': 'products'})
 
     def _answer_weekly(self, tr) -> QaAnswer:
-        from app.services.diagnosis import _build_weekly_compare
-        w = _build_weekly_compare(self.con, tr)
+        from app.services.analytics import build_weekly_compare
+        w = build_weekly_compare(self.con, tr)
         weeks = w.get('weeks') or []
         if len(weeks) < 2:
             return QaAnswer(text='周对比数据不足（至少需要跨两周的数据）。')
@@ -201,9 +201,9 @@ class QaEngine:
         return QaAnswer(text='周度对比：\n' + '\n'.join(lines), meta={'kind': 'weekly'})
 
     def _answer_anomaly(self, tr) -> QaAnswer:
-        from app.services.diagnosis import _build_trend, _detect_anomaly_days
-        trend = _build_trend(self.con, tr)
-        anoms = _detect_anomaly_days(trend)
+        from app.services.analytics import build_trend, detect_anomaly_days
+        trend = build_trend(self.con, tr)
+        anoms = detect_anomaly_days(trend)
         if not anoms:
             return QaAnswer(text='没有检测到异常日（各指标相对前 7 日均值'
                                  '偏离均在 35% 以内）。', meta={'kind': 'anomaly'})
@@ -215,7 +215,7 @@ class QaEngine:
                         meta={'kind': 'anomaly'})
 
     def _answer_caliber(self) -> QaAnswer:
-        from app.services.diagnosis import _build_caliber_compare
+        from app.services.analytics import build_caliber_compare
         # 用注册表自造 metrics 形参不划算 —— 直接查 M13/M14
         try:
             items = []
@@ -225,7 +225,7 @@ class QaEngine:
                 if row and row[0] is not None:
                     items.append({'metric_id': mid, 'value': row[0],
                                   'unit': rq.unit})
-            cc = _build_caliber_compare(items)
+            cc = build_caliber_compare(items)
         except Exception:                       # noqa: BLE001
             cc = {}
         if not cc:

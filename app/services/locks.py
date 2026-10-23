@@ -14,7 +14,7 @@
 
     lk = locks.tenant_lock(tenant_id)
     with lk:                      # 持锁期间独占该租户的 DuckDB
-        con = _open_semantic_db(tenant_id)
+        con = semantic_admin.open_semantic_db(tenant_id)
         try:
             ...
         finally:
