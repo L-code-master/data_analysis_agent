@@ -202,6 +202,83 @@ for _ in range(120):
     time.sleep(0.4)
 check('诊断最终成功', r.json().get('status') == 'succeeded', r.json().get('status'))
 
+# ---------------------------------------------------------------------------
+print('\n[6] P2-30：并发扣减最后 1 次额度 —— 恰好一人成功，余额不透支')
+r = client.post('/api/v1/auth/register', json={
+    'email': 'race@test.com', 'password': 'RaceTest!2026x', 'tenant_name': '并发扣减店'})
+check('注册 201', r.status_code == 201, r.status_code)
+RACE_TID = r.json()['user']['tenant_id']
+acc = billing_svc.get_account(RACE_TID)
+check('新租户余额 1（注册赠送）', acc.balance == 1, acc.balance)
+
+consume_ok: list = []
+consume_rejected: list = []
+
+
+def try_consume(i: int) -> None:
+    try:
+        billing_svc.consume_credit(RACE_TID, f'race-consume-{i}')
+        consume_ok.append(i)
+    except billing_svc.InsufficientCreditsError:
+        consume_rejected.append(i)
+    except Exception as e:                        # noqa: BLE001
+        consume_rejected.append(f'意外异常:{type(e).__name__}:{e}')
+
+
+threads = [threading.Thread(target=try_consume, args=(i,)) for i in range(8)]
+for t in threads:
+    t.start()
+for t in threads:
+    t.join(timeout=30)
+check('线程全部结束', not any(t.is_alive() for t in threads))
+check('★ 恰好 1 次扣减成功', len(consume_ok) == 1, consume_ok)
+check('★ 其余 7 次余额不足被拒', len(consume_rejected) == 7, consume_rejected)
+check('★ 无意外异常（仅 InsufficientCredits）',
+      all(isinstance(x, int) for x in consume_rejected), consume_rejected)
+acc = billing_svc.get_account(RACE_TID)
+check('★ 余额 0（不透支不透负）', acc.balance == 0, acc.balance)
+with db.get_conn() as conn:
+    n_consume = conn.execute(
+        "SELECT COUNT(*) FROM credit_ledger WHERE tenant_id = ? "
+        "AND reason = 'consume'", (RACE_TID,)).fetchone()[0]
+check('★ 流水恰好 1 条 consume', n_consume == 1, n_consume)
+
+# ---------------------------------------------------------------------------
+print('\n[7] P2-30：并发重放退款 —— 只落一次 refund，余额不膨胀')
+o = billing_svc.create_order(RACE_TID, 'single')
+billing_svc.mark_paid(o.order_no, reviewed_by='test')
+acc = billing_svc.get_account(RACE_TID)
+check('充值后余额 1（[6] 已消耗赠送额度）', acc.balance == 1, acc.balance)
+
+billing_svc.consume_credit(RACE_TID, 'race-refund-diag')     # → 余额 0
+
+refunded: list = []
+
+
+def try_refund() -> None:
+    try:
+        billing_svc.refund_credit(RACE_TID, 'race-refund-diag')
+        refunded.append(True)
+    except Exception as e:                        # noqa: BLE001
+        refunded.append(f'{type(e).__name__}: {e}')
+
+
+threads = [threading.Thread(target=try_refund) for _ in range(4)]
+for t in threads:
+    t.start()
+for t in threads:
+    t.join(timeout=30)
+check('线程全部结束', not any(t.is_alive() for t in threads))
+check('★ 4 次并发退款均正常返回', all(x is True for x in refunded), refunded)
+acc = billing_svc.get_account(RACE_TID)
+check('★ 余额回到 1（只退一次不膨胀）', acc.balance == 1, acc.balance)
+with db.get_conn() as conn:
+    n_refund = conn.execute(
+        "SELECT COUNT(*) FROM credit_ledger WHERE tenant_id = ? "
+        "AND reason = 'refund' AND diagnosis_id = 'race-refund-diag'",
+        (RACE_TID,)).fetchone()[0]
+check('★ 流水恰好 1 条 refund（幂等）', n_refund == 1, n_refund)
+
 print()
 print('=' * 78)
 print('模块 6f: ' + ('全部通过' if not fails else f'{len(fails)} 项失败 -> {fails}'))

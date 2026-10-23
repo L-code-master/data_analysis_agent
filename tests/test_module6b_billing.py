@@ -61,8 +61,6 @@ check('订单号已生成', len(o1.order_no) > 10)
 check('状态为 pending', o1.status == 'pending')
 check('金额 ¥49', o1.amount_cents == 4900)
 check('订单可查', billing.get_order_by_no(o1.order_no) is not None)
-check('未知 SKU 被拒绝',
-      _ := (lambda: (billing.create_order(TID, 'bogus') if False else True))())
 
 try:
     billing.create_order(TID, 'bogus')
