@@ -47,9 +47,8 @@ class InvalidCredentialsError(AuthError):
         super().__init__('邮箱或密码错误', 'INVALID_CREDENTIALS')
 
 
-class AccountLockedError(AuthError):
-    def __init__(self, until: str):
-        super().__init__(f'账号已锁定，请于 {until} 后重试', 'ACCOUNT_LOCKED')
+# ★ P3-16：AccountLockedError 已随 P2-17（登录枚举防护）移除 ——
+#   锁定/禁用统一抛 InvalidCredentialsError，不再暴露账号状态。
 
 
 @dataclass(frozen=True)

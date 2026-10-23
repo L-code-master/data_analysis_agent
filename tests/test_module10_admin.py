@@ -342,7 +342,8 @@ print('\n[8] 版本化迁移 + WAL checkpoint（docs/16 P2-27 / P2-23）')
 with db.get_conn() as conn:
     vers = [r0[0] for r0 in conn.execute(
         'SELECT version FROM app_migrations ORDER BY version').fetchall()]
-check('★ app_migrations 已按序应用', vers == [1, 2, 3, 4], vers)
+# v5 = sources.source_type 落列（P3-4）
+check('★ app_migrations 已按序应用', vers == [1, 2, 3, 4, 5], vers)
 ck = db.wal_checkpoint('TRUNCATE')
 check('★ wal_checkpoint 正常返回', ck['mode'] == 'TRUNCATE'
       and 'after' in ck, ck.get('result'))

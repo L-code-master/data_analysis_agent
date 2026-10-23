@@ -46,7 +46,11 @@ export default function SettingsPage() {
       await authApi.changePassword(v.old_password, v.new_password)
       message.success('密码已修改，请重新登录')
       form.resetFields()
-      setTimeout(() => { logout().finally(() => navigate('/login')) }, 800)
+      // ★ P3-23：replace 避免与 RequireAuth 的重定向竞争出两条历史记录；
+      //   changePassword 不再预先清 token，logout() 能正常调用成功
+      setTimeout(() => {
+        logout().finally(() => navigate('/login', { replace: true }))
+      }, 800)
     } catch (e) {
       message.error(errMsg(e))
     } finally {
@@ -138,7 +142,7 @@ export default function SettingsPage() {
             <Input.Password autoComplete="current-password" />
           </Form.Item>
           <Form.Item name="new_password" label="新密码"
-                     extra="至少 10 位，需包含字母、数字、符号中的至少两类"
+                     extra="至少 10 位，且小写字母 / 大写字母 / 数字 / 符号中至少两类"
                      rules={[{ required: true, message: '请输入新密码' },
                              { min: 10, message: '密码至少 10 位' }]}>
             <Input.Password autoComplete="new-password" />

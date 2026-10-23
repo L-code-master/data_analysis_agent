@@ -71,10 +71,15 @@ def make_tenant():
 make_tenant()
 
 # fake 工具实现（引擎逻辑测试不需要真实数据）
+# ★ P3-1：失败 = 抛异常（结构化失败通道），不再用「计算失败」前缀约定
+def _always_fail(_a):
+    raise RuntimeError('测试故意失败')
+
+
 FAKE_IMPL = {
     'list_metrics': lambda a: 'M13 毛利率(财务)：净销售-成本-佣金\nM14 毛利率(推广)：财务口径再扣广告',
     'compute_metric': lambda a: f"{a.get('metric_id')} = 51.00%；口径：退款按申请日",
-    'always_fail': lambda a: '计算失败：测试故意失败',
+    'always_fail': _always_fail,
 }
 
 
@@ -196,9 +201,25 @@ check('被阻后仍能收口回答', '51.00%' in res.answer)
 # ---------------------------------------------------------------------------
 print('\n[4] 连续失败终止（8 次）')
 script = [resp_tools(call(f'f{i}', 'always_fail')) for i in range(10)]
-res = new_engine(script, max_turns=12).run('测失败')
+eng_f = new_engine(script, max_turns=12)
+res = eng_f.run('测失败')
 check('★ 连续失败 8 次循环终止', '连续失败' in res.error, res.error[:60])
 check('失败终止不带答案', res.answer == '')
+check('★ 失败轨迹带 ok=False 标记（P3-1 结构化通道）',
+      any(t.get('ok') is False for t in res.tool_trace))
+check('★ FAILURE_WARN 已注入对话让模型自纠（P3-1）',
+      any('系统提示' in str(m.get('content', ''))
+          for c in eng_f.client.calls for m in c['messages']))
+
+# ★ P3-1 反例：合法返回值以「计算失败」开头不再被误判为工具失败
+script = [resp_tools(call('p1', 'prefix_ok')),
+          LlmResponse(content='已了解', input_tokens=10, output_tokens=5)]
+eng_p = new_engine(script,
+                   impl={'prefix_ok': lambda a: '计算失败商品的真实销售数据如下'})
+res_p = eng_p.run('测前缀')
+check('★ 前缀嗅探已移除（合法返回 ok=True）',
+      res_p.tool_trace and res_p.tool_trace[0].get('ok') is True,
+      res_p.tool_trace[0].get('ok') if res_p.tool_trace else 'no-trace')
 
 # ---------------------------------------------------------------------------
 print('\n[5] 步数上限兜底收口')

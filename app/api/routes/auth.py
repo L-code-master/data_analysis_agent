@@ -16,7 +16,7 @@ from app.api.schemas import (
 from app.config import get_settings
 from app.services import auth
 from app.services.auth import (
-    AccountLockedError, AuthError, EmailExistsError, InvalidCredentialsError,
+    AuthError, EmailExistsError, InvalidCredentialsError,
 )
 
 router = APIRouter(prefix='/auth', tags=['认证'])
@@ -66,11 +66,14 @@ def _user_resp(user: auth.AuthUser) -> UserResponse:
 
 
 def _handle(e: AuthError) -> HTTPException:
-    """把 AuthError 映射成 HTTP 状态码。"""
+    """把 AuthError 映射成 HTTP 状态码。
+
+    ★ P3-16：登录锁定/禁用自 P2-17 起统一走 INVALID_CREDENTIALS(401)，
+      原先的 423(非标准码)映射已无触发路径，删除。
+    """
     code_map = {
         'EMAIL_EXISTS': status.HTTP_409_CONFLICT,
         'INVALID_CREDENTIALS': status.HTTP_401_UNAUTHORIZED,
-        'ACCOUNT_LOCKED': status.HTTP_423_LOCKED,
         'WEAK_PASSWORD': status.HTTP_400_BAD_REQUEST,
         'INVALID_EMAIL': status.HTTP_400_BAD_REQUEST,
         'ACCOUNT_DISABLED': status.HTTP_403_FORBIDDEN,

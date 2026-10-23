@@ -820,6 +820,9 @@ WHERE refund_status = '退款成功'
 GROUP BY 1, 2, 3, 4;
 
 -- 数字溯源（验证层门2 第4条）
+-- ★ docs/16 P3-14：本视图只覆盖 M13 的组件明细；全部 16 指标的通用
+--   溯源走 SQLRenderer.render_trace()（运行时与计算同源，不随口径
+--   修订漂移）—— 静态视图保留作 M13 深度组件回溯。
 CREATE OR REPLACE VIEW v_metric_trace AS
 SELECT p.stat_date, p.item_id, p.merchant_code,
        'M13' AS metric_id, '毛利率（财务口径）' AS metric_name,

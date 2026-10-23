@@ -175,10 +175,12 @@ export const authApi = {
     try { await http.post('/auth/logout') } finally { tokenStore.clear() }
   },
   async changePassword(oldPassword: string, newPassword: string) {
+    // ★ P3-23：不清本地 token —— 服务端已吊销全部 refresh token，
+    //   紧接着的 logout() 会带着有效 access 正常登出（原先先清 token
+    //   导致 logout 必发一个无谓的 401，且与跳转竞争）。
     const { data } = await http.post('/auth/change-password', {
       old_password: oldPassword, new_password: newPassword,
     })
-    tokenStore.clear()
     return data
   },
   /** 邮箱验证（验证成功后发放注册赠送额度） */
@@ -400,10 +402,7 @@ export const billingApi = {
     if (w) setTimeout(() => URL.revokeObjectURL(url), 60_000)
     else URL.revokeObjectURL(url)
   },
-  async confirmOrder(orderNo: string) {
-    const { data } = await http.post<AccountInfo>(`/billing/orders/${orderNo}/confirm`)
-    return data
-  },
+  // ★ confirmOrder（核销）已删：P0-1 起仅平台管理员可调，前端零调用方
   async ledger(limit = 100) {
     const { data } = await http.get<LedgerEntry[]>('/billing/ledger', { params: { limit } })
     return data

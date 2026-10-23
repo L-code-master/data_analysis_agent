@@ -159,31 +159,30 @@ def build_tools(reg, con_getter) -> tuple[list[dict], dict]:
         from app.semantic.registry import SemanticRegistry
         from app.semantic.renderer import SQLRenderer
         con = con_getter()            # open_semantic_db 已按版本迁移
-        try:
-            # ★ 复用 ask 作用域加载好的 registry（docs/16 P1-16）：
-            #   指标定义与 metric_spec 都在内存里，不再每次工具调用重建。
-            #   仅在未传入 registry 时（单测/独立工具）回退到现建。
-            r2 = reg
-            if r2 is None:
-                r2 = SemanticRegistry(con)
-                r2.load()
-            rq = SQLRenderer(r2).render(metric_id=args['metric_id'],
-                                        time_range=_tr(args.get('time_range')))
-            row = con.execute(rq.sql, rq.params).fetchone()
-            value = row[0] if row else None
-            if value is None:
-                return f'{args["metric_id"]}：该范围内无数据'
-            unit = rq.unit or ''
-            if unit == 'percent':
-                vs = f'{value * 100:.2f}%'
-            elif unit == 'currency':
-                vs = f'¥{value:,.2f}'
-            else:
-                vs = f'{value:,}'
-            foot = f'；口径：{rq.footnote}' if rq.footnote else ''
-            return f'{args["metric_id"]} = {vs}{foot}'
-        except Exception as e:                  # noqa: BLE001
-            return f'计算失败：{e}'
+        # ★ 复用 ask 作用域加载好的 registry（docs/16 P1-16）：
+        #   指标定义与 metric_spec 都在内存里，不再每次工具调用重建。
+        #   仅在未传入 registry 时（单测/独立工具）回退到现建。
+        r2 = reg
+        if r2 is None:
+            r2 = SemanticRegistry(con)
+            r2.load()
+        # ★ P3-1：异常向上抛给 _dispatch 统一包装 —— 失败与否由结构化
+        #   通道告知 LoopGuard，不再靠返回文本前缀嗅探。
+        rq = SQLRenderer(r2).render(metric_id=args['metric_id'],
+                                    time_range=_tr(args.get('time_range')))
+        row = con.execute(rq.sql, rq.params).fetchone()
+        value = row[0] if row else None
+        if value is None:
+            return f'{args["metric_id"]}：该范围内无数据'
+        unit = rq.unit or ''
+        if unit == 'percent':
+            vs = f'{value * 100:.2f}%'
+        elif unit == 'currency':
+            vs = f'¥{value:,.2f}'
+        else:
+            vs = f'{value:,}'
+        foot = f'；口径：{rq.footnote}' if rq.footnote else ''
+        return f'{args["metric_id"]} = {vs}{foot}'
 
     def _products(args: dict) -> str:
         rows = build_product_breakdown(con_getter(), _tr(args.get('time_range')))
@@ -307,6 +306,7 @@ class AgentEngine:
         """
         res = AgentTurnResult()
         guard = LoopGuard()
+        injected_warnings: set[str] = set()   # 已注入对话的 guard 警告（P3-1）
         system = SYSTEM_PROMPT
         if data_context:
             system += f'\n\n{data_context}'
@@ -390,22 +390,34 @@ class AgentEngine:
                     ok, block_msg = guard.check_call(call['name'],
                                                      call['arguments'])
                     if not ok:
-                        result_text = block_msg
+                        result_text, tool_ok = block_msg, False
                     else:
-                        result_text = self._dispatch(call['name'],
-                                                     call['arguments'])
-                    ok_call = not result_text.startswith(('计算失败', '该调用已重复'))
-                    if not guard.record_result(call['name'], ok_call):
+                        # ★ P3-1：成败由 _dispatch 结构化返回（异常即失败），
+                        #   不再用「计算失败」中文前缀嗅探 —— 商品名等
+                        #   合法返回值以该前缀开头会被误判成工具失败。
+                        result_text, tool_ok = self._dispatch(call['name'],
+                                                              call['arguments'])
+                    if not guard.record_result(call['name'], tool_ok):
                         res.error = (f'循环终止：连续失败 {LoopGuard.FAILURE_HALT} 次'
                                      f'（工具 {call["name"]}）')
                         res.guard_warnings = guard.warnings
                         return res
                     res.tool_trace.append({'tool': call['name'],
+                                           'ok': tool_ok,
                                            'args': (call['arguments'] or '')[:200],
                                            'result': result_text[:300]})
                     messages.append({'role': 'tool',
                                      'tool_call_id': call['id'],
                                      'content': result_text[:4000]})
+                    # ★ P3-1：FAILURE_WARN 不再只躺在结果里 —— 注入对话，
+                    #   让模型立刻换策略（否则同一坑连踩到 HALT）。
+                    for w in guard.warnings:
+                        if w in injected_warnings:
+                            continue
+                        injected_warnings.add(w)
+                        messages.append({'role': 'user', 'content':
+                                         f'（系统提示：{w}。请改用其他工具或'
+                                         f'参数，或基于已有结果直接回答）'})
 
             # 步数耗尽 → 强制收口（先确认预算，超限不再发起新调用）
             exceeded = budget_error()
@@ -431,19 +443,20 @@ class AgentEngine:
 
     # ------------------------------------------------------------------
 
-    def _dispatch(self, name: str, args_json: str) -> str:
+    def _dispatch(self, name: str, args_json: str) -> tuple[str, bool]:
+        """执行工具。返回 (给模型看的文本, 是否成功) —— P3-1 结构化失败通道。"""
         fn = self.tools_impl.get(name)
         if fn is None:
-            return f'计算失败：未知工具 {name}'
+            return f'计算失败：未知工具 {name}', False
         try:
             args = json.loads(args_json) if args_json and \
                 args_json.strip().startswith('{') else {}
         except json.JSONDecodeError:
             args = {}
         try:
-            return fn(args)
+            return fn(args), True
         except Exception as e:                      # noqa: BLE001
-            return f'计算失败：{type(e).__name__}: {e}'
+            return f'计算失败：{type(e).__name__}: {e}', False
 
     def _record_usage(self, res: AgentTurnResult, resp) -> None:
         res.input_tokens += resp.input_tokens

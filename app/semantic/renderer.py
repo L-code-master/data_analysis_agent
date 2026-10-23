@@ -131,6 +131,7 @@ class SQLRenderer:
         limit: int = 1000,
         filters: dict[str, Any] | None = None,
         metric_ids: Iterable[str] | None = None,
+        include_components: bool = False,
     ) -> RenderedQuery:
         """渲染查询。
 
@@ -142,6 +143,8 @@ class SQLRenderer:
             limit: 结果行数上限
             filters: 等值过滤，如 {'item_id': 'ITEM-A'}
             metric_ids: 多指标时传入（会把多个指标渲染成并列列）
+            include_components: 溯源模式（P3-14）—— RATIO/CROSS_VIEW
+                指标额外输出 `__num` / `__den` 分子分母列，与计算同源
 
         Raises:
             RenderError: 维度越权 / 规格缺失 / 非法值
@@ -196,9 +199,14 @@ class SQLRenderer:
 
         group_cols = [p for _, p in phys_dims]
 
+        # 先建警告列表（build 闭包会写入分组截断提示，P3-9），
+        # 最后再合并口径不确定项
+        warnings: list[str] = []
+
         for m, sp in targets:
             alias = m.metric_id.lower()
-            if sp.get('agg', '').upper() == 'CROSS_VIEW':
+            agg = sp.get('agg', '').upper()
+            if agg == 'CROSS_VIEW':
                 # ★ 跨视图指标禁止带维度切片（docs/16 P0-5）：
                 #   其分子/分母是「整个时间窗的全局标量子查询」，与分组
                 #   维度没有任何关联 —— 渲染成
@@ -210,12 +218,28 @@ class SQLRenderer:
                         f'指标 {m.metric_id}（{m.metric_name}）为跨视图口径，'
                         f'不支持按维度 {list(dims)} 切片 —— 每组会得到相同的'
                         f'全店值。请去掉维度查询总量，或分别查询分子/分母指标')
-                expr, _ = self._expression_cross_view(sp, limit)
-                # 跨视图表达式自带 4 个日期占位符，标记以便 build 补参数
-                cross_view_metrics.append((alias, expr))
-                selects.append(f'{expr} AS {alias}')
+                num_sql, den_sql = self._cross_view_parts(sp)
+                value_expr = f'({num_sql}) / NULLIF(({den_sql}), 0)'
+                # 每个子查询带 2 个日期占位符；值表达式共 4 个
+                cross_view_metrics.append((alias, value_expr, 4))
+                selects.append(f'{value_expr} AS {alias}')
+                if include_components:
+                    # ★ P3-14 溯源模式：分子/分母单列返回（标量子查询需括号）
+                    cross_view_metrics.append((f'{alias}__num', num_sql, 2))
+                    cross_view_metrics.append((f'{alias}__den', den_sql, 2))
+                    selects.append(f'({num_sql}) AS {alias}__num')
+                    selects.append(f'({den_sql}) AS {alias}__den')
+                    columns.extend([f'{alias}__num', f'{alias}__den'])
             else:
                 selects.append(f'{self._expression(sp)} AS {alias}')
+                if include_components and agg == 'RATIO':
+                    # ★ P3-14 溯源模式：RATIO 指标把分子/分母单列返回，
+                    #   「数字怎么来的」与计算同源（静态视图会随口径修订漂移）
+                    n = f'{_agg_fn(sp, "num_agg")}({_require_ident_expr(sp["num_expr"])})'
+                    d = f'{_agg_fn(sp, "den_agg")}({_require_ident_expr(sp["den_expr"])})'
+                    selects.append(f'{n} AS {alias}__num')
+                    selects.append(f'{d} AS {alias}__den')
+                    columns.extend([f'{alias}__num', f'{alias}__den'])
             columns.append(alias)
 
         # ---- 5. WHERE（把时间条件与过滤条件分开记录，便于对比查询复用）----
@@ -247,20 +271,20 @@ class SQLRenderer:
             """按给定日期区间生成 SQL 与参数。
 
             参数顺序必须与 SQL 中 `?` 的出现顺序一致：
-              1) SELECT 中跨视图子查询的日期（每个跨视图指标 4 个）
+              1) SELECT 中跨视图子查询的日期（按各片段占位符数绑定）
               2) WHERE 中的过滤条件
               3) WHERE 中的时间条件
             """
             ps: list[Any] = []
             # 1) 跨视图子查询的日期参数
-            #    跨视图表达式带 4 个日期占位符，无论如何都必须绑定：
+            #    占位符无论如何都必须绑定：
             #    - 有时间窗 → 用该区间
             #    - 无时间窗 → 用全历史区间（1900-01-01 ~ 2999-12-31）
             if cross_view_metrics:
                 rng_s = rng.start if rng is not None else date(1900, 1, 1)
                 rng_e = rng.end if rng is not None else date(2999, 12, 31)
-                for _alias, _expr in cross_view_metrics:
-                    ps.extend([rng_s, rng_e, rng_s, rng_e])
+                for _alias, _expr, _nph in cross_view_metrics:
+                    ps.extend([rng_s, rng_e] * (_nph // 2))
 
             frags: list[str] = []
             # 2a) 指标口径过滤（固定条件，先于用户过滤）
@@ -282,6 +306,9 @@ class SQLRenderer:
             if group_cols:
                 s += '\nGROUP BY ' + ', '.join(group_cols)
                 s += '\nORDER BY ' + ', '.join(group_cols)
+                # ★ P3-9：分组查询可能被 LIMIT 截断 —— 不再静默
+                warnings.append(f'分组结果最多返回 {int(limit)} 行，'
+                                f'超出部分被截断（可缩小时间范围）')
             s += f'\nLIMIT {int(limit)}'
             return s, ps
 
@@ -296,7 +323,7 @@ class SQLRenderer:
 
         # ---- 7. 脚注与告警 ----
         footnote = self._footnote(metric, time_range, targets)
-        warnings = self._warnings(metric, targets)
+        warnings.extend(self._warnings(metric, targets))
 
         return RenderedQuery(
             sql=sql,
@@ -395,8 +422,8 @@ class SQLRenderer:
             return f'COUNT({expr})'
 
         if agg == 'RATIO':
-            n = f"{spec.get('num_agg','SUM')}({_require_ident_expr(spec['num_expr'])})"
-            d = f"{spec.get('den_agg','SUM')}({_require_ident_expr(spec['den_expr'])})"
+            n = f'{_agg_fn(spec, "num_agg")}({_require_ident_expr(spec["num_expr"])})'
+            d = f'{_agg_fn(spec, "den_agg")}({_require_ident_expr(spec["den_expr"])})'
             return f'{n} / NULLIF({d}, 0)'
 
         # 跨视图指标需要额外的日期参数，由渲染器统一处理
@@ -406,23 +433,30 @@ class SQLRenderer:
 
         raise RenderError(f'不支持的聚合类型: {agg}')
 
-    def _expression_cross_view(self, spec: dict, limit: int
-                               ) -> tuple[str, list[Any]]:
-        """生成跨视图表达式与它自带的参数。
+    def _cross_view_parts(self, spec: dict) -> tuple[str, str]:
+        """跨视图指标的分子/分母子查询（各带 2 个日期占位符）。
 
         跨视图指标（如退款率 = 退款金额 / 支付金额）的分子分母在不同视图，
-        必须各自带一份日期条件 —— 因此单独返回参数列表，由调用方拼接。
+        必须各自带一份日期条件 —— 拆成两个片段返回，值表达式与溯源
+        组件（P3-14）共用同一来源，口径永不脱钩。
         """
         nv = _require_ident(spec['num_view'])
         dv = _require_ident(spec['den_view'])
-        n = f"{spec.get('num_agg', 'SUM')}({_require_ident_expr(spec['num_expr'])})"
-        d = f"{spec.get('den_agg', 'SUM')}({_require_ident_expr(spec['den_expr'])})"
-        expr = (
-            f'(SELECT {n} FROM {nv} WHERE stat_date BETWEEN ? AND ?)'
-            f' / NULLIF('
-            f'(SELECT {d} FROM {dv} WHERE stat_date BETWEEN ? AND ?), 0)'
-        )
-        return expr, []
+        n = f'{_agg_fn(spec, "num_agg")}({_require_ident_expr(spec["num_expr"])})'
+        d = f'{_agg_fn(spec, "den_agg")}({_require_ident_expr(spec["den_expr"])})'
+        return (f'SELECT {n} FROM {nv} WHERE stat_date BETWEEN ? AND ?',
+                f'SELECT {d} FROM {dv} WHERE stat_date BETWEEN ? AND ?')
+
+    def render_trace(self, metric_id: str,
+                     time_range: DateRange | None = None,
+                     **kw) -> RenderedQuery:
+        """溯源查询（docs/16 P3-14）：指标值 + 分子/分母组件同列返回。
+
+        与 render() 完全共用解析/过滤/组装 —— 组件口径与实际计算
+        永不脱钩（静态溯源视图会随口径修订漂移成"看似溯源的假账"）。
+        """
+        return self.render(metric_id, time_range=time_range,
+                           include_components=True, **kw)
 
     def _footnote(self, metric: MetricDefinition, time_range, targets) -> str:
         """生成口径脚注。"""
@@ -450,6 +484,18 @@ class SQLRenderer:
                 for item in m.uncertainty.items:
                     w.append(f'{m.metric_name}：{item}')
         return w
+
+
+# ★ P3-9 纵深防御：metric_spec 来自注册表数据（非用户输入），但聚合
+#   函数名会被拼进 SQL —— 只放行白名单，注册表被改坏也不至于注入。
+_ALLOWED_AGG_FNS = ('SUM', 'AVG', 'MIN', 'MAX', 'COUNT')
+
+
+def _agg_fn(spec: dict, key: str) -> str:
+    fn = str(spec.get(key, 'SUM')).upper()
+    if fn not in _ALLOWED_AGG_FNS:
+        raise RenderError(f'不支持的聚合函数 {fn!r}（{key}）')
+    return fn
 
 
 def _require_ident_expr(expr: str) -> str:

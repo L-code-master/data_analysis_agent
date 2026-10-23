@@ -433,6 +433,14 @@ class Settings:
             warns.append('SMTP 已配置主机/账号但 SMTP_PASSWORD 为空 —— '
                          '发送验证邮件可能失败。')
 
+        # ★ P3-17：开发模式 + 真实 LLM key —— 八成是忘了设 production。
+        #   development 下 docs/openapi 与非生产异常详情全部对外暴露。
+        if self.app_env.lower() != 'production' and self.llm_api_key:
+            warns.append(
+                f'APP_ENV={self.app_env} 且已配置 LLM_API_KEY —— 若这是'
+                f'生产部署，必须设 APP_ENV=production（否则 /docs、'
+                f'/openapi.json 与内部异常详情对外暴露）。')
+
         return warns
 
     @staticmethod

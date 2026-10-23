@@ -13,6 +13,7 @@ import logging
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, HTTPException, Request, status
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from starlette.concurrency import run_in_threadpool
@@ -142,6 +143,20 @@ def create_app() -> FastAPI:
             body = {'code': f'HTTP_{exc.status_code}', 'message': str(detail)}
         return JSONResponse(status_code=exc.status_code, content=body,
                             headers=exc.headers)
+
+    # ★ P3-16：请求参数校验失败也统一 {code, message} 契约 ——
+    #   Pydantic 默认返回 {"detail": [...]}，前端 errMsg() 解析不到 message
+    @app.exception_handler(RequestValidationError)
+    async def validation_exc_handler(request: Request,
+                                     exc: RequestValidationError):
+        errs = []
+        for e in exc.errors()[:5]:
+            loc = '.'.join(str(x) for x in e.get('loc', [])[1:]) or '?'
+            errs.append(f'{loc}: {e.get("msg", "")}')
+        return JSONResponse(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            content={'code': 'VALIDATION_ERROR',
+                     'message': '请求参数不合法：' + '；'.join(errs)})
 
     @app.exception_handler(Exception)
     async def unhandled_handler(request: Request, exc: Exception):

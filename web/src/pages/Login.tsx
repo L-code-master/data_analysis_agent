@@ -1,5 +1,5 @@
 import { useState } from 'react'
-import { Link, useNavigate } from 'react-router-dom'
+import { Link, useLocation, useNavigate } from 'react-router-dom'
 import { Button, Card, Form, Input, Typography, App as AntApp } from 'antd'
 import { LockOutlined, MailOutlined } from '@ant-design/icons'
 import { useAuth } from '../stores/auth'
@@ -8,6 +8,7 @@ import { errMsg } from '../api/client'
 export default function LoginPage() {
   const { login, loading } = useAuth()
   const navigate = useNavigate()
+  const location = useLocation()
   const { message } = AntApp.useApp()
   const [form] = Form.useForm()
 
@@ -15,7 +16,11 @@ export default function LoginPage() {
     try {
       await login(v.email, v.password)
       message.success('登录成功')
-      navigate('/dashboard', { replace: true })
+      // ★ P3-20：回到登录前想访问的页面（RequireAuth 存在 state.from），
+      //   原先记录后弃用一律跳工作台
+      const from = (location.state as { from?: string } | null)?.from
+      navigate(from && /^\/[^/]/.test(from) ? from : '/dashboard',
+              { replace: true })
     } catch (e) {
       message.error(errMsg(e))
     }

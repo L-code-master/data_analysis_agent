@@ -50,12 +50,9 @@ from app.storage import db
 logger = logging.getLogger(__name__)
 
 
-def _now() -> str:
-    return dt.datetime.now(dt.timezone.utc).isoformat()
-
-
-def _rg(row, name: str, idx: int):
-    return row[name] if hasattr(row, 'keys') else row[idx]
+# ★ P3-7：与 chat/billing 共用的时间与行取值实现收口 app.utils
+from app.utils import now_iso as _now
+from app.utils import row_get as _rg
 
 
 # ===========================================================================
@@ -221,17 +218,17 @@ def register_source(tenant_id: str, user_id: str, original_name: str,
                 sid = _rg(dup, 'id', 0)
                 conn.execute(
                     'UPDATE sources SET row_count = ?, profile_ref = ?, '
-                    'status = ? WHERE id = ?',
-                    (prepared.read.row_count, _aid, 'profiled', sid))
+                    'source_type = ?, status = ? WHERE id = ?',
+                    (prepared.read.row_count, _aid, spec.key, 'profiled', sid))
             else:
                 try:
                     conn.execute(
                         'INSERT INTO sources (id,tenant_id,uploaded_by,filename,'
-                        'original_name,sheet_name,size_bytes,sha256,platform,'
-                        'row_count,profile_ref,status,created_at) '
-                        'VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)',
+                        'original_name,sheet_name,source_type,size_bytes,'
+                        'sha256,platform,row_count,profile_ref,status,'
+                        'created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
                         (sid, tenant_id, user_id, path.name, safe_name, sheet,
-                         len(content), digest, 'taobao',
+                         spec.key, len(content), digest, 'taobao',
                          prepared.read.row_count, _aid, 'profiled', now))
                 except sqlite3.IntegrityError:
                     # ★ docs/16 P3-5：并发上传相同文件撞去重唯一索引 ——
@@ -246,8 +243,9 @@ def register_source(tenant_id: str, user_id: str, original_name: str,
                     sid = _rg(dup, 'id', 0)
                     conn.execute(
                         'UPDATE sources SET row_count = ?, profile_ref = ?, '
-                        'status = ? WHERE id = ?',
-                        (prepared.read.row_count, _aid, 'profiled', sid))
+                        'source_type = ?, status = ? WHERE id = ?',
+                        (prepared.read.row_count, _aid, spec.key,
+                         'profiled', sid))
 
         records.append(SourceRecord(
             id=sid, tenant_id=tenant_id, filename=path.name,
@@ -262,30 +260,33 @@ def register_source(tenant_id: str, user_id: str, original_name: str,
 def get_source(tenant_id: str, source_id: str) -> SourceRecord:
     with db.get_conn() as conn:
         row = conn.execute(
-            'SELECT id,tenant_id,filename,original_name,sheet_name,size_bytes,'
-            'sha256,platform,row_count,profile_ref,status,created_at '
-            'FROM sources WHERE id = ? AND tenant_id = ?',
+            'SELECT id,tenant_id,filename,original_name,sheet_name,'
+            'source_type,size_bytes,sha256,platform,row_count,profile_ref,'
+            'status,created_at FROM sources WHERE id = ? AND tenant_id = ?',
             (source_id, tenant_id)).fetchone()
     if row is None:
         raise SourceNotFoundError(source_id)
 
-    # source_type 从画像产物读
-    stype = ''
-    try:
-        ap = tn.get_artifact_path(tenant_id, 'profile', _rg(row, 'profile_ref', 10))
-        stype = json.loads(ap.read_text(encoding='utf-8')).get('source_type', '')
-    except (FileNotFoundError, json.JSONDecodeError):
-        pass
+    # ★ P3-4：source_type 直读列；仅历史行为空时回读画像产物兜底
+    stype = _rg(row, 'source_type', 5) or ''
+    if not stype:
+        try:
+            ap = tn.get_artifact_path(tenant_id, 'profile',
+                                      _rg(row, 'profile_ref', 11))
+            stype = json.loads(ap.read_text(encoding='utf-8')).get(
+                'source_type', '')
+        except (FileNotFoundError, json.JSONDecodeError, tn.TenantPathError):
+            pass
 
     return SourceRecord(
         id=_rg(row, 'id', 0), tenant_id=_rg(row, 'tenant_id', 1),
         filename=_rg(row, 'filename', 2), original_name=_rg(row, 'original_name', 3) or '',
         sheet_name=_rg(row, 'sheet_name', 4) or '',
-        size_bytes=_rg(row, 'size_bytes', 5), sha256=_rg(row, 'sha256', 6),
-        platform=_rg(row, 'platform', 7) or 'taobao', source_type=stype,
-        row_count=_rg(row, 'row_count', 8) or 0,
-        profile_ref=_rg(row, 'profile_ref', 9) or '',
-        status=_rg(row, 'status', 10), created_at=_rg(row, 'created_at', 11))
+        size_bytes=_rg(row, 'size_bytes', 6), sha256=_rg(row, 'sha256', 7),
+        platform=_rg(row, 'platform', 8) or 'taobao', source_type=stype,
+        row_count=_rg(row, 'row_count', 9) or 0,
+        profile_ref=_rg(row, 'profile_ref', 10) or '',
+        status=_rg(row, 'status', 11), created_at=_rg(row, 'created_at', 12))
 
 
 # ===========================================================================
@@ -911,20 +912,20 @@ def list_diagnoses(tenant_id: str, limit: int = 50) -> list[dict]:
 def list_sources(tenant_id: str, limit: int = 50) -> list[dict]:
     with db.get_conn() as conn:
         rows = conn.execute(
-            'SELECT id,original_name,filename,sheet_name,size_bytes,row_count,'
-            'status,created_at '
+            'SELECT id,original_name,filename,sheet_name,source_type,'
+            'size_bytes,row_count,status,created_at '
             'FROM sources WHERE tenant_id = ? ORDER BY created_at DESC LIMIT ?',
             (tenant_id, int(limit))).fetchall()
     return [{
         'source_id': _rg(r, 'id', 0),
         'name': (_rg(r, 'original_name', 1) or _rg(r, 'filename', 2))
                 + (f' / {_rg(r, "sheet_name", 3)}' if _rg(r, 'sheet_name', 3) else ''),
-        'source_type': '',
+        'source_type': _rg(r, 'source_type', 4) or '',
         'sheet_name': _rg(r, 'sheet_name', 3) or '',
-        'size_bytes': _rg(r, 'size_bytes', 4),
-        'row_count': _rg(r, 'row_count', 5) or 0,
-        'status': _rg(r, 'status', 6),
-        'created_at': _rg(r, 'created_at', 7),
+        'size_bytes': _rg(r, 'size_bytes', 5),
+        'row_count': _rg(r, 'row_count', 6) or 0,
+        'status': _rg(r, 'status', 7),
+        'created_at': _rg(r, 'created_at', 8),
     } for r in rows]
 
 

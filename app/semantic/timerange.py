@@ -112,8 +112,11 @@ def parse_range(text: str, today: date | None = None) -> DateRange:
     m = _ABSOLUTE_RANGE.match(norm)
     if m:
         g = [int(x) for x in m.groups()]
-        s = date(g[0], g[1], g[2])
-        e = date(g[3], g[4], g[5])
+        try:                                   # ★ P3-10：非法日期给口径一致的错误
+            s = date(g[0], g[1], g[2])
+            e = date(g[3], g[4], g[5])
+        except ValueError as e:
+            raise TimeRangeError(f'日期不合法: {e}') from e
         if s > e:
             s, e = e, s
         return DateRange(s, e, f'{s}~{e}', 'day')
@@ -121,7 +124,10 @@ def parse_range(text: str, today: date | None = None) -> DateRange:
     # ---- 绝对日 ----
     m = _ABS_DAY.match(norm)
     if m:
-        d = date(int(m.group(1)), int(m.group(2)), int(m.group(3)))
+        try:
+            d = date(int(m.group(1)), int(m.group(2)), int(m.group(3)))
+        except ValueError as e:
+            raise TimeRangeError(f'日期不合法: {e}') from e
         return DateRange(d, d, d.isoformat(), 'day')
 
     # ---- 绝对月 ----

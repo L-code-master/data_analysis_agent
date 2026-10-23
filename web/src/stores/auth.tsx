@@ -25,6 +25,10 @@ interface AuthContextValue {
 
 const AuthContext = createContext<AuthContextValue | null>(null)
 
+// ★ P3-25：模块级去重 —— dev StrictMode 双挂载会让初始化 effect 跑两次，
+//   原先每次都发 /auth/me。复用同一 Promise 只发一次。
+let _initPromise: Promise<void> | null = null
+
 export function AuthProvider({ children }: { children: ReactNode }) {
   const [user, setUser] = useState<UserInfo | null>(null)
   const [loading, setLoading] = useState(false)
@@ -63,7 +67,10 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   }, [])
 
   useEffect(() => {
-    if (!initialized) void refresh()
+    if (!initialized) {
+      _initPromise = _initPromise ?? refresh()
+      void _initPromise
+    }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
 

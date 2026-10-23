@@ -114,11 +114,13 @@ def normalize_column(name: Any) -> str:
 # 读取
 # ---------------------------------------------------------------------------
 
-def detect_encoding(path: Path, sample_size: int = 65536) -> str:
+def detect_encoding(path: Path, sample_size: int = 524288) -> str:
     """探测 CSV 编码。
 
     国内导出常见：UTF-8-BOM / GBK / GB18030。
     优先用 charset-normalizer（若可用），否则按 BOM + 试解码。
+    ★ P3-10：采样 64KB→512KB —— 前段 ASCII 表头、后段才出现中文的
+      大文件会被 64KB 截断误判（charset-normalizer 拿不到中文样本）。
     """
     raw = path.read_bytes()[:sample_size]
 

@@ -233,6 +233,7 @@ CREATE TABLE IF NOT EXISTS sources (
     filename          TEXT NOT NULL,                    -- 服务端生成名（防穿越）
     original_name     TEXT,                             -- 客户端原名（仅展示）
     sheet_name        TEXT DEFAULT '',                  -- ★Excel 工作表名（多表拆分用；CSV 为 ''）
+    source_type       TEXT NOT NULL DEFAULT '',         -- 识别类型（trade_orders/…，P3-4 直读不再回查画像）
     size_bytes        INTEGER NOT NULL,
     sha256            TEXT NOT NULL,                    -- 去重 + 完整性
     platform          TEXT,                             -- douyin | taobao | pdd | amazon | other

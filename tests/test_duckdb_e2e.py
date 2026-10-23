@@ -480,6 +480,34 @@ if not check_cols:
     print(f'      表列: {_db_cols}')
     print(f'      _COLUMNS: {_MD._COLUMNS}')
 
+# ===========================================================================
+print('\n[11] ★ 指标溯源模式（docs/16 P3-14：render_trace 组件与计算同源）')
+from app.semantic.registry import SemanticRegistry as _Reg   # noqa: E402
+from app.semantic.renderer import SQLRenderer as _R          # noqa: E402
+
+_reg2 = _Reg(con)
+_reg2.load()
+_rq = _R(_reg2).render_trace('M03')
+_row = con.execute(_rq.sql, _rq.params).fetchone()
+# 列序：值、__num、__den（M03 = 支付买家数 / 访客数，含 SHOP+TOTAL 过滤）
+assert_eq('★ M03 溯源 num=36（支付买家数）', _row[1], 36)
+assert_eq('★ M03 溯源 den=1950（访客数）', _row[2], 1950)
+assert_eq('★ M03 值 = num/den（口径同源）', round(_row[0], 9),
+          round(36 / 1950, 9))
+
+_rq17 = _R(_reg2).render_trace('M17')
+_row17 = con.execute(_rq17.sql, _rq17.params).fetchone()
+assert_eq('★ M17 跨视图溯源分子=退款 400', float(_row17[1]), 400.0)
+assert_eq('★ M17 跨视图溯源分母=支付 10800', float(_row17[2]), 10800.0)
+assert_eq('★ M17 值 = 分子/分母', round(float(_row17[0]), 9),
+          round(400 / 10800, 9))
+# 溯源列已声明（m17__num/__den）
+_cols_ok = ('m17__num' in _rq17.columns and 'm17__den' in _rq17.columns)
+print(f'    [{"PASS" if _cols_ok else "FAIL"}] ★ 溯源列已声明（m17__num/__den）'
+      f'  {list(_rq17.columns)}')
+if not _cols_ok:
+    fails.append('溯源列声明')
+
 print()
 print('=' * 78)
 print('✅ 端到端全部通过' if not fails else f'❌ {len(fails)} 项失败: {fails}')

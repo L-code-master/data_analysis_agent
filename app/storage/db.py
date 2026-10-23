@@ -160,6 +160,8 @@ _APP_MIGRATIONS: list[tuple[int, str, list[str]]] = [
       'ON diagnosis_sources(source_id)',
       'CREATE INDEX IF NOT EXISTS idx_chat_tenant '
       'ON chat_messages(tenant_id, created_at DESC)']),
+    (5, 'sources 落 source_type 列（P3-4：不再每次读画像产物取类型）',
+     ["ALTER TABLE sources ADD COLUMN source_type TEXT NOT NULL DEFAULT ''"]),
 ]
 
 

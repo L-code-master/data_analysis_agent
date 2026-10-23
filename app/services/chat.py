@@ -23,12 +23,9 @@ from app.semantic.registry import SemanticRegistry
 from app.services.semantic_admin import open_semantic_db
 
 
-def _now() -> str:
-    return dt.datetime.now(dt.timezone.utc).isoformat()
-
-
-def _rg(row, name, idx):
-    return row[name] if hasattr(row, 'keys') else row[idx]
+# ★ P3-7：与 diagnosis/billing 共用的时间与行取值实现收口 app.utils
+from app.utils import now_iso as _now
+from app.utils import row_get as _rg
 
 
 # ---------------------------------------------------------------------------

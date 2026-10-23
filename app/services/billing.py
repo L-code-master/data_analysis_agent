@@ -126,15 +126,9 @@ class Order:
         }
 
 
-def _now() -> str:
-    return dt.datetime.now(dt.timezone.utc).isoformat()
-
-
-def _row_get(row, name: str, idx: int):
-    """兼容 sqlite3.Row 与 tuple。"""
-    if hasattr(row, 'keys'):
-        return row[name]
-    return row[idx]
+# ★ P3-7：与 diagnosis/chat 共用的时间与行取值实现收口 app.utils
+from app.utils import now_iso as _now          # noqa: E402
+from app.utils import row_get as _row_get
 
 
 # ---------------------------------------------------------------------------
