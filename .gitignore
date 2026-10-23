@@ -82,10 +82,10 @@ temp/
 artifacts/
 
 # --- 本地私有资料（不上传）---
+# ★ 2026-10-23 业主要求：docs/ 全部维持本地私有，不入版本控制
 harness_py/
 harness_py_pro/
 docs/
-CLAUDE.md
 README.local.md
 
 # --- 前端依赖缓存与构建临时目录 ---
