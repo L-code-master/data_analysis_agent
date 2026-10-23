@@ -102,9 +102,7 @@ class Settings:
     llm_api_key: str = ''
     llm_base_url: str = ''
     llm_model: str = 'qwen3.8-flash'
-    llm_model_heavy: str = 'qwen3.8-max'
-    llm_context_window: int = 262144
-    llm_max_output: int = 16384
+    llm_context_window: int = 262144   # Agent 压缩预算按此推导（P3-13）
     llm_timeout_seconds: int = 60          # 单次 LLM 调用超时（P1-13）
     agent_max_duration_seconds: int = 300  # 一次 Agent 循环整体 deadline
     agent_max_cost_usd: float = 0.10       # 一次 Agent 循环成本上限
@@ -143,9 +141,7 @@ class Settings:
     # ★ 额度批次化有效期（docs/16 P1-6）：0 = 永久有效
     pack5_valid_days: int = 180
     credit_expire_days: int = 365
-    cost_alert_cents: int = 60
     billing_provider: str = 'manual'
-    manual_review_required: bool = True
     # 同一租户 24h 内自动退款上限，超限转人工（防"永远失败"刷退款，P1-7）
     max_auto_refunds_per_day: int = 10
 
@@ -173,13 +169,10 @@ class Settings:
     # ---------------- 报告 ----------------
     report_format: str = 'html'
     report_brand_name: str = '经营诊断报告'
-    report_template_dir: str = './templates/report'
 
     # ---------------- 观测 ----------------
     log_level: str = 'INFO'
     log_dir: str = './data/logs'
-    audit_log_enabled: bool = True
-    metrics_enabled: bool = True
 
     # ---------------- CORS ----------------
     cors_origins: str = 'http://127.0.0.1:5173'
@@ -211,9 +204,7 @@ class Settings:
             llm_api_key=_get(env, 'LLM_API_KEY', ''),
             llm_base_url=_get(env, 'LLM_BASE_URL', ''),
             llm_model=_get(env, 'LLM_MODEL', 'qwen3.8-flash'),
-            llm_model_heavy=_get(env, 'LLM_MODEL_HEAVY', 'qwen3.8-max'),
             llm_context_window=_get_int(env, 'LLM_CONTEXT_WINDOW', 262144),
-            llm_max_output=_get_int(env, 'LLM_MAX_OUTPUT', 16384),
             llm_timeout_seconds=_get_int(env, 'LLM_TIMEOUT_SECONDS', 60),
             agent_max_duration_seconds=_get_int(
                 env, 'AGENT_MAX_DURATION_SECONDS', 300),
@@ -248,9 +239,7 @@ class Settings:
             trial_once_per_user=_get_bool(env, 'TRIAL_ONCE_PER_USER', True),
             pack5_valid_days=_get_int(env, 'PACK5_VALID_DAYS', 180),
             credit_expire_days=_get_int(env, 'CREDIT_EXPIRE_DAYS', 365),
-            cost_alert_cents=_get_int(env, 'COST_ALERT_CENTS', 60),
             billing_provider=_get(env, 'BILLING_PROVIDER', 'manual'),
-            manual_review_required=_get_bool(env, 'MANUAL_REVIEW_REQUIRED', True),
             max_auto_refunds_per_day=_get_int(
                 env, 'MAX_AUTO_REFUNDS_PER_DAY', 10),
             rate_limit_enabled=_get_bool(env, 'RATE_LIMIT_ENABLED', True),
@@ -266,12 +255,9 @@ class Settings:
 
             report_format=_get(env, 'REPORT_FORMAT', 'html'),
             report_brand_name=_get(env, 'REPORT_BRAND_NAME', '经营诊断报告'),
-            report_template_dir=_get(env, 'REPORT_TEMPLATE_DIR', './templates/report'),
 
             log_level=_get(env, 'LOG_LEVEL', 'INFO'),
             log_dir=_get(env, 'LOG_DIR', './data/logs'),
-            audit_log_enabled=_get_bool(env, 'AUDIT_LOG_ENABLED', True),
-            metrics_enabled=_get_bool(env, 'METRICS_ENABLED', True),
 
             cors_origins=_get(env, 'CORS_ORIGINS', 'http://127.0.0.1:5173'),
 

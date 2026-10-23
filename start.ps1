@@ -105,7 +105,8 @@ Start-Sleep -Seconds 6
 
 try {
     $h = Invoke-RestMethod 'http://127.0.0.1:8000/api/v1/health' -TimeoutSec 10
-    Write-Host "  后端就绪 (status=$($h.status), 表=$($h.database.tables))" -ForegroundColor Green
+    # 公开 health 已脱敏（P2-13），只有 status/version
+    Write-Host "  后端就绪 (status=$($h.status), version=$($h.version))" -ForegroundColor Green
 } catch {
     Write-Host '  后端启动失败，请检查 .env 与依赖；日志：' -ForegroundColor Red
     Write-Host "    $BackendLog" -ForegroundColor White

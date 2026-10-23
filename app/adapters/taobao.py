@@ -569,8 +569,50 @@ FIELD_TYPES: dict[str, dict[str, str]] = {
 
 
 def field_type_of(table: str, field: str) -> str:
-    """查字段类型；表或字段未知时返回 'text'（保守，不猜数值）。"""
+    """查字段类型；表或字段未知时返回 'text'（保守，不猜数值）。
+
+    ★ docs/16 P2-28：优先用从语义层 information_schema 读到的**真实**
+      类型（load_field_types 缓存），手抄 FIELD_TYPES 仅作无 DuckDB
+      连接时的离线兜底 —— 一致性由 test_duckdb_e2e 的守护测试拦截。
+    """
+    if _field_types_live is not None:
+        return _field_types_live.get(table, {}).get(field, 'text')
     return FIELD_TYPES.get(table, {}).get(field, 'text')
+
+
+# DuckDB 类型 → 转换层粗分类
+_DUCKDB_TYPE_KIND = {
+    'DATE': 'date', 'TIMESTAMP': 'datetime', 'DATETIME': 'datetime',
+    'VARCHAR': 'text', 'TEXT': 'text', 'CHAR': 'text', 'UUID': 'text',
+    'BOOLEAN': 'text',           # STG 层无布尔，保守按文本
+    'TINYINT': 'int', 'SMALLINT': 'int', 'INTEGER': 'int',
+    'BIGINT': 'int', 'HUGEINT': 'int',
+    'FLOAT': 'float', 'REAL': 'float', 'DOUBLE': 'float', 'DECIMAL': 'float',
+}
+
+_field_types_live: dict[str, dict[str, str]] | None = None
+
+
+def load_field_types(con) -> dict[str, dict[str, str]]:
+    """从 information_schema 读全部 STG 字段类型并缓存（P2-28）。
+
+    返回 {table: {column: kind}}，kind ∈ date/datetime/text/int/float，
+    与 coerce 层粗分类一致。首次调用后缓存（各租户库 schema 相同）。
+    """
+    global _field_types_live
+    if _field_types_live is not None:
+        return _field_types_live
+    rows = con.execute(
+        'SELECT table_name, column_name, data_type '
+        'FROM information_schema.columns '
+        "WHERE table_name LIKE 'stg\\_%' ESCAPE '\\' "
+        'ORDER BY table_name, ordinal_position').fetchall()
+    out: dict[str, dict[str, str]] = {}
+    for t, c, dtype in rows:
+        base = str(dtype or '').upper().split('(')[0].strip()
+        out.setdefault(str(t), {})[str(c)] = _DUCKDB_TYPE_KIND.get(base, 'text')
+    _field_types_live = out
+    return out
 
 
 _BLANK_TOKENS = ('-', '--', '—', '/', 'NULL', 'null', 'None')

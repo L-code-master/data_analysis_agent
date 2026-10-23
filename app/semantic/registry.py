@@ -56,8 +56,12 @@ class SemanticRegistry:
     # ------------------------------------------------------------------
     def load(self) -> int:
         """从 sem_metric_registry + sem_metric_dimension 加载全部指标。"""
+        # ★ docs/16 P2-28：显式列名（与 MetricDefinition._COLUMNS 一致），
+        #   不用 SELECT * —— schema.sql 在中间加列会让位置映射整体错位
+        #   （_COLUMNS 与表列的一致性由 test_duckdb_e2e 守护测试拦截）。
+        cols = ', '.join(MetricDefinition._COLUMNS)
         rows = self._conn.execute(
-            'SELECT * FROM sem_metric_registry ORDER BY metric_id'
+            f'SELECT {cols} FROM sem_metric_registry ORDER BY metric_id'
         ).fetchall()
 
         # 维度白名单（只取 enabled=1）

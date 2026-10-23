@@ -27,6 +27,7 @@ from __future__ import annotations
 import datetime as dt
 import json
 import logging
+import sqlite3
 import uuid
 from dataclasses import dataclass, field
 from typing import Any, Callable
@@ -223,14 +224,30 @@ def register_source(tenant_id: str, user_id: str, original_name: str,
                     'status = ? WHERE id = ?',
                     (prepared.read.row_count, _aid, 'profiled', sid))
             else:
-                conn.execute(
-                    'INSERT INTO sources (id,tenant_id,uploaded_by,filename,'
-                    'original_name,sheet_name,size_bytes,sha256,platform,'
-                    'row_count,profile_ref,status,created_at) '
-                    'VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)',
-                    (sid, tenant_id, user_id, path.name, safe_name, sheet,
-                     len(content), digest, 'taobao',
-                     prepared.read.row_count, _aid, 'profiled', now))
+                try:
+                    conn.execute(
+                        'INSERT INTO sources (id,tenant_id,uploaded_by,filename,'
+                        'original_name,sheet_name,size_bytes,sha256,platform,'
+                        'row_count,profile_ref,status,created_at) '
+                        'VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)',
+                        (sid, tenant_id, user_id, path.name, safe_name, sheet,
+                         len(content), digest, 'taobao',
+                         prepared.read.row_count, _aid, 'profiled', now))
+                except sqlite3.IntegrityError:
+                    # ★ docs/16 P3-5：并发上传相同文件撞去重唯一索引 ——
+                    #   BEGIN IMMEDIATE 下理论上已串行，这里兜底回读按
+                    #   去重处理，而不是 500。
+                    dup = conn.execute(
+                        "SELECT id FROM sources WHERE tenant_id = ? "
+                        "AND sha256 = ? AND sheet_name = COALESCE(?, '')",
+                        (tenant_id, digest, sheet)).fetchone()
+                    if dup is None:
+                        raise
+                    sid = _rg(dup, 'id', 0)
+                    conn.execute(
+                        'UPDATE sources SET row_count = ?, profile_ref = ?, '
+                        'status = ? WHERE id = ?',
+                        (prepared.read.row_count, _aid, 'profiled', sid))
 
         records.append(SourceRecord(
             id=sid, tenant_id=tenant_id, filename=path.name,
@@ -406,6 +423,10 @@ def _import_stg(con, prepared, mapping: dict[str, str],
 
     if not col_of:
         return 0, {}
+
+    # ★ docs/16 P2-28：类型以语义层 information_schema 为准（单一事实源），
+    #   不再依赖适配器里手抄的 FIELD_TYPES（仅离线兜底）。
+    taobao.load_field_types(con)
 
     con.execute(f'DELETE FROM {table}')
 

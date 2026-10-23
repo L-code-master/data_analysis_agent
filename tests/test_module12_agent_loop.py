@@ -211,8 +211,10 @@ check('实际轮次 ≤ 上限+1', res.turns <= 4, res.turns)
 
 # ---------------------------------------------------------------------------
 print('\n[6] 上下文压缩接入（超预算触发 v1.3 压缩库）')
-# run() 只保留最近 20 条历史 → 单条造长（3000 token × 20 条 > 60000 预算）
-history = [{'role': 'user', 'content': f'历史问题{i} ' + '长' * 3000}
+# run() 只保留最近 20 条历史 → 单条造长。压缩预算自 P3-13 起按
+# LLM_CONTEXT_WINDOW/4 推导（默认 262k 窗口 → 65.5k），
+# 6000 字 × 20 条 ≈ 120k > 65.5k，稳定触发。
+history = [{'role': 'user', 'content': f'历史问题{i} ' + '长' * 6000}
            for i in range(25)]
 script = [LlmResponse(content='收到', input_tokens=10, output_tokens=5)]
 res = new_engine(script).run('现在回答', history=history)

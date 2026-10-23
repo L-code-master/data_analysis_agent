@@ -95,7 +95,14 @@ class LlmClient:
                 continue
             if resp.status_code != 200:
                 raise LlmError(f'HTTP {resp.status_code}: {resp.text[:300]}')
-            return self._parse(resp.json())
+            # ★ P3-3：200 但非 JSON（网关错误页等）必须转成 LlmError，
+            #   原先 JSONDecodeError 冒泡出去既不被重试也不被引擎分类。
+            try:
+                data = resp.json()
+            except ValueError:
+                last_err = LlmError(f'响应不是 JSON: {resp.text[:200]}')
+                continue
+            return self._parse(data)
 
         raise LlmError(f'重试 {self.MAX_RETRIES} 次后仍失败: {last_err}')
 
@@ -115,9 +122,12 @@ class LlmClient:
                     'arguments': fn.get('arguments', '{}'),
                 })
             usage = data.get('usage', {}) or {}
-            # 兼容 reasoning 字段的多种命名
+            # 兼容 reasoning 字段的多种命名。
+            # ★ P3-3：completion_tokens_details 可能为 null ——
+            #   原先在 None 上 .get 会 AttributeError 且成本不记账。
+            details = usage.get('completion_tokens_details') or {}
             rt = (usage.get('reasoning_tokens')
-                  or usage.get('completion_tokens_details', {}).get('reasoning_tokens')
+                  or details.get('reasoning_tokens')
                   or 0)
             return LlmResponse(
                 content=msg.get('content') or '',
@@ -129,6 +139,21 @@ class LlmClient:
             )
         except (KeyError, IndexError, TypeError) as e:
             raise LlmError(f'响应解析失败: {e}; body={str(data)[:200]}') from e
+
+
+# ---------------------------------------------------------------------------
+# 共享单例（docs/16 P3-6）
+# ---------------------------------------------------------------------------
+# 原先每次 ask 都新建 LlmClient（连带 requests.Session）且从不关闭 ——
+# 长对话会积累连接。客户端无状态（配置来自 settings），全局复用一个。
+_shared_client: LlmClient | None = None
+
+
+def get_shared_client() -> LlmClient:
+    global _shared_client
+    if _shared_client is None:
+        _shared_client = LlmClient()
+    return _shared_client
 
 
 class FakeLlmClient:

@@ -12,7 +12,7 @@ from typing import Annotated
 from fastapi import Depends, Header, HTTPException, Request, status
 
 from app.config import get_settings
-from app.services import auth, billing, ratelimit
+from app.services import auth, ratelimit
 from app.services.auth import AuthError, AuthUser
 
 
@@ -92,39 +92,9 @@ async def get_current_user(
 # 类型别名，便于路由签名简洁
 CurrentUser = Annotated[AuthUser, Depends(get_current_user)]
 
-
-async def require_owner(user: CurrentUser) -> AuthUser:
-    """要求 owner 角色（用于购买、配额管理等敏感操作）。"""
-    if not user.is_owner:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail='需要店铺管理员权限')
-    return user
-
-
-OwnerUser = Annotated[AuthUser, Depends(require_owner)]
-
-
-async def require_credits(user: CurrentUser) -> AuthUser:
-    """要求有可用额度（用于发起诊断）。
-
-    超级管理员放行（docs/12：测试通行证，只免额度这一道闸）。
-    """
-    if user.is_admin:
-        return user
-    acc = billing.get_account(user.tenant_id)
-    if not acc.can_diagnose:
-        raise HTTPException(
-            status_code=status.HTTP_402_PAYMENT_REQUIRED,
-            detail={
-                'code': 'INSUFFICIENT_CREDITS',
-                'message': f'诊断次数不足（当前 {acc.balance} 次），请先购买',
-                'balance': acc.balance,
-            })
-    return user
-
-
-CreditUser = Annotated[AuthUser, Depends(require_credits)]
+# ★ docs/16 P3-8：require_owner / require_credits 定义后从未被路由使用
+#   （各路由内联了自己的检查，P0-1 的核销权限漂移正源于此）—— 已删。
+#   额度检查的唯一实现：diagnoses._precheck；管理员豁免见 docs/12。
 
 
 class RequestContext:

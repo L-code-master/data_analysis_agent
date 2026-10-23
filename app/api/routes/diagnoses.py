@@ -19,7 +19,7 @@ import time
 import uuid
 from typing import Any
 
-from fastapi import APIRouter, HTTPException, status
+from fastapi import APIRouter, HTTPException, Query, status
 from fastapi.responses import HTMLResponse, StreamingResponse
 from starlette.concurrency import run_in_threadpool
 
@@ -132,19 +132,8 @@ def _sweep_progress() -> int:
         _drop_queue(d)
     return len(stale)
 
-
-def _terminal_event(did: str) -> dict | None:
-    """取历史中的终态事件（done / error）。
-
-    用途：若客户端在诊断完成之后才订阅 SSE，历史里已经没有
-    可回放的 done 事件（或事件被裁剪），需要合成一个终态事件，
-    否则前端会一直等不到“完成”。
-    """
-    with _lock:
-        for ev in reversed(_history.get(did, [])):
-            if ev.get('type') in ('done', 'error'):
-                return ev
-    return None
+# ★ docs/16 P3-8：_terminal_event 无调用方（订阅回放已由历史缓冲 +
+#   seq 去重覆盖），已删。
 
 
 def _history_of(did: str) -> list[dict]:
@@ -460,7 +449,7 @@ async def diagnosis_events(ctx: Ctx, diagnosis_id: str):
 # ---------------------------------------------------------------------------
 
 @router.get('', response_model=list[DiagnosisResponse], summary='诊断列表')
-def list_diagnoses(ctx: Ctx, limit: int = 50):
+def list_diagnoses(ctx: Ctx, limit: int = Query(50, ge=1, le=500)):
     rows = dg.list_diagnoses(ctx.tenant_id, limit=limit)
     return [DiagnosisResponse(
         diagnosis_id=r['diagnosis_id'], status=r['status'], phase=r['phase'],

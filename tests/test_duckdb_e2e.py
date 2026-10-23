@@ -448,6 +448,38 @@ print(f'    [{"PASS" if check_qc_seg else "FAIL"}] quality 段内容正确')
 if not check_qc_seg:
     fails.append('quality 段内容')
 
+# ===========================================================================
+print('\n[10] ★ 双 schema 一致性守护（docs/16 P2-28）')
+from app.adapters import taobao as _taobao                    # noqa: E402
+from app.semantic.models import MetricDefinition as _MD        # noqa: E402
+
+# 手抄 FIELD_TYPES ↔ 语义层 information_schema（运行时以库为准）
+_live_types = _taobao.load_field_types(con)
+_drift = {t: {'py': _taobao.FIELD_TYPES.get(t, {}),
+              'db': _live_types.get(t, {})}
+          for t in set(_taobao.FIELD_TYPES) | set(_live_types)
+          if _taobao.FIELD_TYPES.get(t, {}) != _live_types.get(t, {})}
+check_ft = not _drift
+print(f'    [{"PASS" if check_ft else "FAIL"}] FIELD_TYPES 与 information_schema 完全一致'
+      + ('' if check_ft else f' 漂移表: {sorted(_drift)}'))
+if not check_ft:
+    fails.append('FIELD_TYPES 漂移')
+    for _t, _v in _drift.items():
+        print(f'      {_t}: py={_v["py"]} db={_v["db"]}')
+
+# 注册表显式列名 ↔ 表列顺序（registry.load 不再 SELECT *，按位置映射
+# 依赖 _COLUMNS 与表列一致）
+_db_cols = [r[0] for r in con.execute(
+    "SELECT column_name FROM information_schema.columns "
+    "WHERE table_name = 'sem_metric_registry' ORDER BY ordinal_position"
+).fetchall()]
+check_cols = tuple(_db_cols[:len(_MD._COLUMNS)]) == _MD._COLUMNS
+print(f'    [{"PASS" if check_cols else "FAIL"}] MetricDefinition._COLUMNS 与表列前缀一致')
+if not check_cols:
+    fails.append('registry 列映射漂移')
+    print(f'      表列: {_db_cols}')
+    print(f'      _COLUMNS: {_MD._COLUMNS}')
+
 print()
 print('=' * 78)
 print('✅ 端到端全部通过' if not fails else f'❌ {len(fails)} 项失败: {fails}')

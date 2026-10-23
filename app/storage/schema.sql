@@ -208,7 +208,7 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_orders_trial_once
     ON orders(tenant_id, sku) WHERE sku = 'trial' AND status = 'paid';
 
 -- ---------------------------------------------------------------------------
--- 7. 支付回调原始记录（幂等 + 对账）
+-- 7.1 支付回调原始记录（预留，当前无消费方 —— 见 docs/16 P2-19）
 -- ---------------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS payment_events (
     id                TEXT PRIMARY KEY,

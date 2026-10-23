@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import logging
 
-from fastapi import APIRouter, HTTPException, status
+from fastapi import APIRouter, HTTPException, Query, status
 
 from app.api.deps import Ctx
 from app.config import get_settings
@@ -62,7 +62,7 @@ def health_detail(ctx: Ctx):
 
 
 @router.get('/refunds', summary='待补偿退款列表')
-def list_refunds(ctx: Ctx, status: str = '', limit: int = 100):
+def list_refunds(ctx: Ctx, status: str = '', limit: int = Query(100, ge=1, le=500)):
     _require_admin(ctx)
     return {'items': billing.list_refund_pending(limit=limit, status=status)}
 
@@ -90,7 +90,7 @@ def writeoff_refund(ctx: Ctx, pending_id: str, note: str = ''):
 # ---------------------------------------------------------------------------
 
 @router.get('/tenants', summary='租户清单（含磁盘目录有无）')
-def list_tenants(ctx: Ctx, status: str = '', limit: int = 200):
+def list_tenants(ctx: Ctx, status: str = '', limit: int = Query(200, ge=1, le=500)):
     """平台管理员查看租户与状态；配合 POST /status 停用/恢复。"""
     _require_admin(ctx)
     from app.services import tenant as tn

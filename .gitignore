@@ -94,3 +94,5 @@ README.local.md
 .testtmp/
 web/dist/
 web/node_modules/
+
+.commit_msg.tmp

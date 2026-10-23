@@ -14,7 +14,7 @@ import uuid
 from app.config import get_settings
 from app.storage import db
 from app.services.agent_engine import AgentEngine, build_tools
-from app.services.llm_client import LlmClient
+from app.services.llm_client import get_shared_client
 from app.services import billing, locks
 from app.services.qa_engine import (
     ClarifyUserError, NeedsAgentError, QaAnswer, QaEngine,
@@ -383,7 +383,7 @@ def ask(tenant_id: str, user_id: str, session_id: str,
 
     spec, impl = build_tools(reg, con_getter)
     impl = {name: _locked(fn) for name, fn in impl.items()}
-    engine = AgentEngine(LlmClient(), tenant_id, spec, impl)
+    engine = AgentEngine(get_shared_client(), tenant_id, spec, impl)
     try:
         res = engine.run(question, history=history,
                          data_context=_data_context_prompt(ctx))

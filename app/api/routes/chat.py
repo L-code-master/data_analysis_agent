@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from fastapi import APIRouter, HTTPException, status
+from fastapi import APIRouter, HTTPException, Query, status
 
 from app.api.deps import Ctx, enforce_rate_limit
 from app.api.schemas import (
@@ -37,7 +37,7 @@ async def create_session(ctx: Ctx, title: str = ''):
 
 @router.get('/sessions', response_model=list[ChatSessionResponse],
             summary='对话列表')
-async def list_sessions(ctx: Ctx, limit: int = 30):
+async def list_sessions(ctx: Ctx, limit: int = Query(30, ge=1, le=200)):
     return [ChatSessionResponse(**s)
             for s in chat_svc.list_sessions(ctx.tenant_id, limit)]
 
@@ -45,7 +45,7 @@ async def list_sessions(ctx: Ctx, limit: int = 30):
 @router.get('/sessions/{session_id}/messages',
             response_model=list[ChatMessageResponse],
             summary='对话消息历史')
-async def get_messages(ctx: Ctx, session_id: str, limit: int = 100):
+async def get_messages(ctx: Ctx, session_id: str, limit: int = Query(100, ge=1, le=500)):
     return [ChatMessageResponse(**m)
             for m in chat_svc.list_messages(ctx.tenant_id, session_id, limit)]
 

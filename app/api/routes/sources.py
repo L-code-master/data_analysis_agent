@@ -5,7 +5,7 @@ from __future__ import annotations
 import logging
 
 from fastapi import (
-    APIRouter, File, HTTPException, Request, UploadFile, status,
+    APIRouter, File, HTTPException, Query, Request, UploadFile, status,
 )
 from starlette.concurrency import run_in_threadpool
 
@@ -107,7 +107,7 @@ async def upload_source(ctx: Ctx, request: Request,
 
 
 @router.get('', response_model=list[SourceResponse], summary='数据源列表')
-def list_sources(ctx: Ctx, limit: int = 50):
+def list_sources(ctx: Ctx, limit: int = Query(50, ge=1, le=500)):
     rows = dg.list_sources(ctx.tenant_id, limit=limit)
     return [SourceResponse(
         source_id=r['source_id'], name=r['name'],

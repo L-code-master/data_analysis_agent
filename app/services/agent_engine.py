@@ -25,7 +25,6 @@ from app.services.llm_client import LlmClient, LlmError
 __all__ = ['AgentEngine', 'AgentTurnResult', 'LoopGuard', 'build_tools']
 
 MAX_TURNS = 8                       # 循环步数上限（防失控）
-CONTEXT_BUDGET_TOKENS = 60_000      # 触发压缩的消息区预算（保守值）
 
 logger = logging.getLogger(__name__)
 
@@ -288,7 +287,10 @@ class AgentEngine:
         self.compressor = Compressor(
             estimator=TokenEstimator(),
             summarizer=None,                 # L3 摘要需注入 LLM，二期接
-            budget_tokens=CONTEXT_BUDGET_TOKENS,
+            # ★ P3-13：预算不再硬编码 60k —— 与 LLM_CONTEXT_WINDOW 脱钩
+            #   会让换小窗口模型时压缩永不触发、超限直接失败。
+            #   按窗口 1/4 估（扣除输出预留与系统提示），下限 20k。
+            budget_tokens=max(20_000, s.llm_context_window // 4),
             keep_recent=10,
         )
         self.model = s.llm_model

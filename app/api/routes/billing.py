@@ -10,7 +10,7 @@ from __future__ import annotations
 import logging
 from pathlib import Path
 
-from fastapi import APIRouter, File, HTTPException, Request, UploadFile, status
+from fastapi import APIRouter, File, HTTPException, Query, Request, UploadFile, status
 from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import FileResponse
 
@@ -56,7 +56,7 @@ def account(ctx: Ctx):
 
 
 @router.get('/orders', response_model=list[OrderResponse], summary='订单列表')
-def list_orders(ctx: Ctx, limit: int = 50):
+def list_orders(ctx: Ctx, limit: int = Query(50, ge=1, le=500)):
     return [OrderResponse(**o.to_dict())
             for o in billing.list_orders(ctx.tenant_id, limit=limit)]
 
@@ -145,7 +145,7 @@ def download_proof(ctx: Ctx, order_no: str):
 
 
 @router.get('/ledger', response_model=list[LedgerEntry], summary='额度流水')
-def ledger(ctx: Ctx, limit: int = 100):
+def ledger(ctx: Ctx, limit: int = Query(100, ge=1, le=500)):
     """额度增减明细（客服对账用）。"""
     return [LedgerEntry(**e) for e in billing.list_ledger(ctx.tenant_id, limit)]
 

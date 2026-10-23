@@ -26,7 +26,9 @@ print('\n[1] 配置加载')
 s = get_settings()
 print(f'  APP_ENV                = {s.app_env}')
 print(f'  LLM_MODEL              = {s.llm_model}')
-print(f'  LLM_BASE_URL           = {s.llm_base_url[:60]}...')
+# ★ docs/16 测试项：不打印开发者真实 LLM_BASE_URL（端点属半敏感配置，
+#   输出会进 CI 日志/截图），只报是否已配置
+print(f'  LLM_BASE_URL           = {"SET (len=%d)" % len(s.llm_base_url) if s.llm_base_url else "EMPTY"}')
 print(f'  LLM_API_KEY            = {"SET (len=%d)" % len(s.llm_api_key) if s.llm_api_key else "EMPTY"}')
 print(f'  SANDBOX_NETWORK_ISOLATED = {s.sandbox_network_isolated}')
 print(f'  PRICE_TRIAL_CENTS      = {s.price_trial_cents} (¥{s.price_trial_cents/100:.0f})')
