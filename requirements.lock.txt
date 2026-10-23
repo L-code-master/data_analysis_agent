@@ -1,0 +1,14 @@
+# requirements.lock.txt —— 已验证环境的精确版本（自动生成，勿手改）
+# 生成：见 requirements.txt 头部说明 · 环境：conda data_agent / Python 3.12
+
+requests==2.34.2
+openpyxl==3.1.5
+charset-normalizer==3.5.2
+duckdb==1.5.6
+fastapi==0.143.3
+uvicorn==0.54.0
+pydantic==2.13.5
+python-multipart==0.0.32
+httpx==0.28.1
+bcrypt==5.0.0
+PyJWT==2.15.1

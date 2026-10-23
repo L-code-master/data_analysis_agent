@@ -251,7 +251,7 @@ def get_artifact_path(tenant_id: str, kind: str, artifact_id: str,
     """取产物路径（不存在则报错，不静默返回空）。"""
     if not re.fullmatch(r'[A-Za-z0-9_-]{8,64}', artifact_id or ''):
         raise TenantPathError(f'非法的产物 ID: {artifact_id!r}')
-    if not re.fullmatch(r'[a-z]{1,32}', kind or ''):
+    if not re.fullmatch(r'[a-z_]{1,32}', kind or ''):
         raise TenantPathError(f'非法的产物类型: {kind!r}')
 
     p = tenant_paths(tenant_id)

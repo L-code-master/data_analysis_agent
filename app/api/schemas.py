@@ -242,9 +242,11 @@ class OrderResponse(BaseModel):
     provider: str
     created_at: str
     paid_at: str = ''
+    pay_proof_ref: str = ''      # 付款凭证（P2-19，空 = 未上传）
 
 
 class LedgerEntry(BaseModel):
+    id: str = ''                 # 行主键（P3-22）
     delta: int
     balance_after: int
     reason: str

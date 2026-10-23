@@ -187,6 +187,8 @@ export interface OrderInfo {
   provider: string
   created_at: string
   paid_at: string
+  /** 付款凭证引用（空 = 未上传，P2-19） */
+  pay_proof_ref?: string
 }
 
 export interface LedgerEntry {

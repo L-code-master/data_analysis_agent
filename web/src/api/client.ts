@@ -381,6 +381,25 @@ export const billingApi = {
     const { data } = await http.post<OrderInfo>(`/billing/orders/${orderNo}/cancel`)
     return data
   },
+  /** 上传付款凭证（转账截图/PDF，≤5MB），供平台管理员核销核对（P2-19） */
+  async attachProof(orderNo: string, file: File) {
+    const fd = new FormData()
+    fd.append('file', file)
+    const { data } = await http.post<{ order_no: string; pay_proof_ref: string }>(
+      `/billing/orders/${orderNo}/proof`, fd,
+      { headers: { 'Content-Type': 'multipart/form-data' }, timeout: 0 })
+    return data
+  },
+  /** 带 JWT 下载付款凭证 blob（订单归属方/管理员） */
+  async openProof(orderNo: string) {
+    const resp = await authFetch(`/api/v1/billing/orders/${orderNo}/proof`)
+    if (!resp.ok) throw new Error(`凭证加载失败（HTTP ${resp.status}）`)
+    const blob = await resp.blob()
+    const url = URL.createObjectURL(blob)
+    const w = window.open(url, '_blank')
+    if (w) setTimeout(() => URL.revokeObjectURL(url), 60_000)
+    else URL.revokeObjectURL(url)
+  },
   async confirmOrder(orderNo: string) {
     const { data } = await http.post<AccountInfo>(`/billing/orders/${orderNo}/confirm`)
     return data

@@ -1,9 +1,9 @@
 import { useEffect, useState } from 'react'
 import {
   Alert, Button, Card, Col, Modal, Row, Space, Table, Tag, Typography,
-  App as AntApp,
+  Upload, App as AntApp,
 } from 'antd'
-import { CheckOutlined } from '@ant-design/icons'
+import { CheckOutlined, PaperClipOutlined } from '@ant-design/icons'
 import dayjs from 'dayjs'
 import { billingApi, errMsg } from '../api/client'
 import type { AccountInfo, LedgerEntry, OrderInfo, PlanInfo } from '../api/types'
@@ -90,6 +90,17 @@ export default function BillingPage() {
         }
       },
     })
+  }
+
+  /** ★ P2-19：上传付款凭证（管理员核销的审计依据）。 */
+  const doUploadProof = async (orderNo: string, file: File) => {
+    try {
+      await billingApi.attachProof(orderNo, file)
+      message.success('凭证已上传，请把订单号发给服务方等待核销')
+      await load()
+    } catch (e) {
+      message.error(errMsg(e))
+    }
   }
 
   /** ★ P2-34：取消订单加确认弹窗 + 防重复点击（原直接发请求可连点）。 */
@@ -215,12 +226,37 @@ export default function BillingPage() {
               render: (v: string) => (v ? dayjs(v).format('MM-DD HH:mm') : '—'),
             },
             {
-              title: '操作', width: 90,
+              title: '操作', width: 200,
               render: (_, r) => r.status === 'pending' ? (
-                <Button type="link" size="small" danger
-                        onClick={() => cancel(r.order_no)}>
-                  取消
-                </Button>
+                <Space size={4}>
+                  {/* P2-19：付款后上传凭证，管理员核销时有审计依据 */}
+                  <Upload
+                    accept=".jpg,.jpeg,.png,.webp,.pdf"
+                    showUploadList={false}
+                    beforeUpload={(file) => {
+                      const f = file as unknown as File
+                      if (f.size > 5 * 1024 * 1024) {
+                        message.error('凭证超过 5MB 上限')
+                        return Upload.LIST_IGNORE
+                      }
+                      void doUploadProof(r.order_no, f)
+                      return false
+                    }}
+                  >
+                    <Button type="link" size="small" icon={<PaperClipOutlined />}>
+                      {r.pay_proof_ref ? '重传凭证' : '上传凭证'}
+                    </Button>
+                  </Upload>
+                  <Button type="link" size="small"
+                          onClick={() => billingApi.openProof(r.order_no)}
+                          style={{ display: r.pay_proof_ref ? undefined : 'none' }}>
+                    查看
+                  </Button>
+                  <Button type="link" size="small" danger
+                          onClick={() => cancel(r.order_no)}>
+                    取消
+                  </Button>
+                </Space>
               ) : null,
             },
           ]}

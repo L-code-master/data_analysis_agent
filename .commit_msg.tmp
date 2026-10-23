@@ -1,25 +1,27 @@
-﻿feat: P2-20/23/27/29 租户治理 + 版本化迁移 + WAL + 血缘表
+﻿feat: P2-19/21/22 付款凭证通道 + 依赖收敛 + start.ps1 加固
 
-P2-20 租户状态消费(此前 tenants.status 零消费方, 停用租户照常使用):
-- tenant.py 新增 ensure_tenant_active/list_tenants/set_tenant_status
-- 上传/诊断/对话/下单四个写路径前置检查 -> 403 TENANT_SUSPENDED
-- 诊断路由 _precheck 同步返回 403(不再 202 后线程里失败)
-- admin 端新增租户清单与停用恢复接口
-- 冒烟改固定租户(409->登录), 余额断言改相对值, 不再每次 +1 租户
+P2-19 pay_proof_ref 凭证通道(人工核销的审计依据):
+- billing.attach_pay_proof 与 get_pay_proof: 凭证存租户沙箱产物区
+  (内容寻址), orders.pay_proof_ref 记引用; jpg/png/webp/pdf, 5MB 上限
+- 路由: owner 上传(重传覆盖), 归属方与平台管理员可下载;
+  Content-Length 预检(同 P1-14)
+- Order 与 OrderResponse 贯通 pay_proof_ref 字段
+- billing.py 头注改为如实描述: payment_events 是回调预留死表,
+  不存在回调幂等(原注释误导)
+- 前端 Billing: 待付款订单可上传并查看凭证
+- tenant.get_artifact_path 的 kind 正则放宽允许下划线
+- 6de 补 8 项凭证断言(上传、下载、管理员、类型、大小)
 
-P2-23 WAL checkpoint:
-- db.wal_checkpoint(TRUNCATE) 助手; 启动 lifespan 在对账后落盘
-- scripts/maintenance.py: check(对账报告)/checkpoint/backup
-  (先落盘再拷贝, 实测 787KB wal -> 收缩)/purge-orphans(默认 dry-run)
+P2-21 依赖收敛(逐个核对 import):
+- 移除零引用的 pandas、numpy、XlsxWriter、scipy、matplotlib、
+  pydantic-settings、jinja2、itsdangerous、PyYAML、structlog、
+  pytest、pytest-asyncio 与 alipay-sdk-python(死依赖)
+- 新增 requirements.lock.txt(已验证环境 12 个直接依赖精确版本)
 
-P2-27 SQLite 顺序迁移:
-- app_migrations 版本表 + _APP_MIGRATIONS 按序执行;
-  仅容忍 duplicate column(老库旧逻辑补过列), 其余失败必须抛出
-- 收编原硬编码 ALTER 元组; 删除 _initialized_paths 死代码(P3-8)
+P2-22 start.ps1 加固:
+- 启动前检测 8000 与 5173 端口占用, 给出 PID 与停止指引(原先二次
+  启动假成功, 旧进程继续服务旧代码)
+- 后端输出重定向到 logs 目录(原先随隐藏窗口丢失)
+- 前端记录真实监听 5173 的 node PID(cmd 包装 PID 单列)
 
-P2-29 诊断-数据源血缘:
-- diagnosis_sources 关联表(迁移 v4 + schema.sql 同步)
-- run_diagnosis 导入后落血缘行(多源输入集合库内可查证)
-- chat_messages 补租户索引(配额计数不再全表扫)
-
-模块 10 新增 [7] 租户停用/恢复(17 项断言)与 [8] 迁移+checkpoint 验证。
+附带: 删除误提交的 .commit_msg.tmp。

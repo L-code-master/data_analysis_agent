@@ -8,8 +8,11 @@
 from __future__ import annotations
 
 import logging
+from pathlib import Path
 
-from fastapi import APIRouter, HTTPException, status
+from fastapi import APIRouter, File, HTTPException, Request, UploadFile, status
+from fastapi.concurrency import run_in_threadpool
+from fastapi.responses import FileResponse
 
 from app.api.deps import Ctx, CurrentUser
 from app.api.schemas import (
@@ -98,6 +101,47 @@ def cancel_order(ctx: Ctx, order_no: str):
     except Exception as e:
         raise _handle(e) from e
     return OrderResponse(**canceled.to_dict())
+
+
+@router.post('/orders/{order_no}/proof', summary='上传付款凭证（P2-19）')
+async def upload_proof(ctx: Ctx, order_no: str, request: Request,
+                       file: UploadFile = File(...)):
+    """把转账截图/PDF 挂到 pending 订单，供平台管理员核销时核对。
+
+    jpg/png/webp/pdf，≤5MB。重复上传覆盖（以最新凭证为准）。
+    """
+    # Content-Length 预检（同 P1-14：不整包读内存后才报错）
+    declared = request.headers.get('content-length')
+    if declared and int(declared) > billing.PROOF_MAX_BYTES + 8192:
+        raise HTTPException(
+            status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+            detail={'code': 'BAD_PROOF_SIZE',
+                    'message': '凭证超过 5MB 上限'})
+    content = await file.read(billing.PROOF_MAX_BYTES + 1)
+    if len(content) > billing.PROOF_MAX_BYTES:
+        raise HTTPException(
+            status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+            detail={'code': 'BAD_PROOF_SIZE',
+                    'message': '凭证超过 5MB 上限'})
+    try:
+        res = await run_in_threadpool(
+            billing.attach_pay_proof, order_no, ctx.tenant_id,
+            file.filename or 'proof', content)
+    except Exception as e:
+        raise _handle(e) from e
+    return res
+
+
+@router.get('/orders/{order_no}/proof', summary='下载付款凭证')
+def download_proof(ctx: Ctx, order_no: str):
+    """订单归属方或平台管理员可下载；无凭证返回 404 NO_PROOF。"""
+    try:
+        path, media = billing.get_pay_proof(order_no, ctx.tenant_id,
+                                            is_admin=ctx.user.is_admin)
+    except Exception as e:
+        raise _handle(e) from e
+    return FileResponse(path, media_type=media,
+                        filename=f'proof-{order_no}{Path(path).suffix}')
 
 
 @router.get('/ledger', response_model=list[LedgerEntry], summary='额度流水')

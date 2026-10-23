@@ -8,7 +8,10 @@
   2. 扣减用条件 UPDATE（balance >= n）防超扣，绝不出现负余额
   3. 体验价限购由**数据库唯一索引**强制，不靠应用层判断
   4. 订单金额一律用「分」存储，避免浮点误差
-  5. 支付回调幂等（payment_events 唯一索引）
+  5. 收款确认为**平台管理员人工核销**（P0-1）；用户可附付款凭证
+     （pay_proof_ref，P2-19）作为核销审计依据。
+     payment_events 表为将来接入支付回调预留 —— 当前无消费方，
+     不存在"回调幂等"（勿据此假设）。
 """
 
 from __future__ import annotations
@@ -102,6 +105,7 @@ class Order:
     created_at: str
     paid_at: str = ''
     provider_trade_no: str = ''
+    pay_proof_ref: str = ''
 
     @property
     def amount_yuan(self) -> float:
@@ -118,6 +122,7 @@ class Order:
             'provider': self.provider,
             'created_at': self.created_at,
             'paid_at': self.paid_at,
+            'pay_proof_ref': self.pay_proof_ref,
         }
 
 
@@ -402,7 +407,7 @@ def get_order_by_no(order_no: str) -> Order | None:
     with db.get_conn() as conn:
         row = conn.execute(
             'SELECT id,order_no,tenant_id,sku,quantity,amount_cents,status,'
-            'provider,created_at,paid_at,provider_trade_no '
+            'provider,created_at,paid_at,provider_trade_no,pay_proof_ref '
             'FROM orders WHERE order_no = ?', (order_no,)).fetchone()
     if row is None:
         return None
@@ -418,6 +423,7 @@ def get_order_by_no(order_no: str) -> Order | None:
         created_at=_row_get(row, 'created_at', 8) or '',
         paid_at=_row_get(row, 'paid_at', 9) or '',
         provider_trade_no=_row_get(row, 'provider_trade_no', 10) or '',
+        pay_proof_ref=_row_get(row, 'pay_proof_ref', 11) or '',
     )
 
 
@@ -425,7 +431,7 @@ def list_orders(tenant_id: str, limit: int = 50) -> list[Order]:
     with db.get_conn() as conn:
         rows = conn.execute(
             'SELECT id,order_no,tenant_id,sku,quantity,amount_cents,status,'
-            'provider,created_at,paid_at,provider_trade_no '
+            'provider,created_at,paid_at,provider_trade_no,pay_proof_ref '
             'FROM orders WHERE tenant_id = ? ORDER BY created_at DESC LIMIT ?',
             (tenant_id, int(limit))).fetchall()
     return [Order(
@@ -437,6 +443,7 @@ def list_orders(tenant_id: str, limit: int = 50) -> list[Order]:
         created_at=_row_get(r, 'created_at', 8) or '',
         paid_at=_row_get(r, 'paid_at', 9) or '',
         provider_trade_no=_row_get(r, 'provider_trade_no', 10) or '',
+        pay_proof_ref=_row_get(r, 'pay_proof_ref', 11) or '',
     ) for r in rows]
 
 
@@ -549,6 +556,89 @@ def cancel_order(order_no: str) -> Order:
     if o is None:
         raise OrderNotFoundError(order_no)
     return o
+
+
+# ---------------------------------------------------------------------------
+# 付款凭证（docs/16 P2-19：人工核销的审计依据）
+# ---------------------------------------------------------------------------
+
+PROOF_MAX_BYTES = 5 * 1024 * 1024
+PROOF_ALLOWED_EXT = frozenset({'.jpg', '.jpeg', '.png', '.webp', '.pdf'})
+_PROOF_MEDIA = {
+    '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.png': 'image/png',
+    '.webp': 'image/webp', '.pdf': 'application/pdf',
+}
+
+
+def attach_pay_proof(order_no: str, tenant_id: str, filename: str,
+                     content: bytes) -> dict:
+    """把付款凭证（截图/PDF）挂到 pending 订单上。
+
+    凭证存租户沙箱产物区（内容寻址），orders.pay_proof_ref 记
+    "artifact_id.ext"；管理员核销时可下载核对 —— 没有凭证的核销
+    只剩管理员主观判断，出纠纷无据可查。
+    """
+    from app.services import tenant as tn
+
+    ext = '.' + (filename.rsplit('.', 1)[-1].lower()
+                 if '.' in filename else '')
+    if ext not in PROOF_ALLOWED_EXT:
+        raise BillingError(
+            f'凭证仅支持 {", ".join(sorted(PROOF_ALLOWED_EXT))}，'
+            f'收到 {ext or "(无扩展名)"}', 'BAD_PROOF_TYPE')
+    if not content or len(content) > PROOF_MAX_BYTES:
+        raise BillingError(
+            f'凭证大小需在 1B~{PROOF_MAX_BYTES // 1024 // 1024}MB 之间',
+            'BAD_PROOF_SIZE')
+
+    with db.get_conn() as conn:
+        row = conn.execute(
+            'SELECT id, status, tenant_id FROM orders WHERE order_no = ?',
+            (order_no,)).fetchone()
+    if row is None:
+        raise OrderNotFoundError(order_no)
+    if _row_get(row, 'tenant_id', 2) != tenant_id:
+        raise OrderNotFoundError(order_no)     # 不暴露他人订单存在性
+    if _row_get(row, 'status', 1) != 'pending':
+        raise BillingError('只有待支付订单能上传凭证', 'ORDER_NOT_PENDING')
+
+    aid, _path = tn.put_artifact(tenant_id, 'pay_proof', content, ext=ext)
+    ref = f'{aid}{ext}'
+    with db.transaction() as conn:
+        conn.execute(
+            'UPDATE orders SET pay_proof_ref = ?, updated_at = ? '
+            'WHERE order_no = ?', (ref, _now(), order_no))
+    return {'order_no': order_no, 'pay_proof_ref': ref}
+
+
+def get_pay_proof(order_no: str, tenant_id: str,
+                  is_admin: bool = False) -> tuple[str, str]:
+    """取凭证文件路径与媒体类型（订单归属方或平台管理员）。
+
+    Returns: (路径, media_type)；无凭证抛 BillingError。
+    """
+    import re as _re
+    from app.services import tenant as tn
+
+    with db.get_conn() as conn:
+        row = conn.execute(
+            'SELECT tenant_id, pay_proof_ref FROM orders WHERE order_no = ?',
+            (order_no,)).fetchone()
+    if row is None:
+        raise OrderNotFoundError(order_no)
+    owner = _row_get(row, 'tenant_id', 0)
+    if owner != tenant_id and not is_admin:
+        raise OrderNotFoundError(order_no)
+
+    ref = _row_get(row, 'pay_proof_ref', 1) or ''
+    if not ref:
+        raise BillingError('该订单未上传付款凭证', 'NO_PROOF')
+    aid, _, ext = ref.rpartition('.')
+    if not _re.fullmatch(r'[A-Za-z0-9_-]{8,64}', aid or '') \
+            or ('.' + ext.lower()) not in PROOF_ALLOWED_EXT:
+        raise BillingError('凭证引用非法', 'BAD_PROOF_REF')
+    path = tn.get_artifact_path(owner, 'pay_proof', aid, ext='.' + ext)
+    return str(path), _PROOF_MEDIA['.' + ext.lower()]
 
 
 # ---------------------------------------------------------------------------

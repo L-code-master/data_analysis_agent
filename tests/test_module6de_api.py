@@ -324,6 +324,34 @@ if r.status_code == 200:
           hd.get('database', {}).get('tables', 0) >= 15
           and hd.get('sandbox', {}).get('network_isolated') is True, hd)
 
+# ★ P2-19：付款凭证通道 —— owner 上传、归属方/管理员可下载
+proof_png = b'\x89PNG\r\n\x1a\n' + b'0' * 64      # 假 PNG 内容（只测流转）
+r = client.post(f'/api/v1/billing/orders/{order["order_no"]}/proof',
+                headers=H, files={'file': ('转账截图.png', proof_png, 'image/png')})
+check('★ 上传凭证 200', r.status_code == 200, r.text[:100])
+proof_ref = r.json().get('pay_proof_ref', '')
+check('★ 返回凭证引用（png）', proof_ref.endswith('.png'), proof_ref)
+
+r = client.get(f'/api/v1/billing/orders/{order["order_no"]}/proof', headers=H)
+check('★ owner 下载凭证 200', r.status_code == 200, r.status_code)
+check('★ Content-Type image/png',
+      r.headers.get('content-type', '').startswith('image/png'),
+      r.headers.get('content-type', '')[:30])
+r = client.get(f'/api/v1/billing/orders/{order["order_no"]}/proof',
+               headers=H_ADMIN)
+check('★ 管理员可下载凭证（核销审计）', r.status_code == 200, r.status_code)
+
+# 类型/大小/越权负向
+r = client.post(f'/api/v1/billing/orders/{order["order_no"]}/proof',
+                headers=H, files={'file': ('x.exe', b'MZ', 'application/x-msdownload')})
+check('★ 非法类型被拒 400', r.status_code == 400
+      and r.json().get('code') == 'BAD_PROOF_TYPE', r.status_code)
+r = client.post(f'/api/v1/billing/orders/{order["order_no"]}/proof',
+                headers=H,
+                files={'file': ('big.png', b'x' * (5 * 1024 * 1024 + 2), 'image/png')})
+check('★ 超 5MB 被拒 413', r.status_code == 413
+      and r.json().get('code') == 'BAD_PROOF_SIZE', r.status_code)
+
 r = client.post(f'/api/v1/billing/orders/{order["order_no"]}/confirm',
                 headers=H_ADMIN)
 check('管理员核销 200', r.status_code == 200, r.text[:120])
