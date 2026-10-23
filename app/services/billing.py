@@ -362,6 +362,10 @@ def create_order(tenant_id: str, sku: str, user_id: str = '') -> Order:
     if sku not in ('trial', 'single', 'pack5'):
         raise BillingError(f'未知的商品: {sku!r}', 'INVALID_SKU')
 
+    # P2-20：停用租户拒绝新订单（已有订单的核销/退款不受影响）
+    from app.services import tenant as _tn
+    _tn.ensure_tenant_active(tenant_id)
+
     if sku == 'trial' and s.trial_once_per_user:
         acc = get_account(tenant_id)
         if acc.trial_used:

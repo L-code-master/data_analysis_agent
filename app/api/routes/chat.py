@@ -11,6 +11,7 @@ from app.api.schemas import (
 )
 from app.config import get_settings
 from app.services import chat as chat_svc
+from app.services.tenant import TenantSuspendedError
 
 router = APIRouter(prefix='/chat', tags=['对话分析'])
 
@@ -87,5 +88,9 @@ def ask(ctx: Ctx, session_id: str, req: AskRequest):
             status_code=status.HTTP_402_PAYMENT_REQUIRED,
             detail={'code': 'COST_QUOTA_EXCEEDED',
                     'message': e.message}) from e
+    except TenantSuspendedError as e:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail={'code': e.code, 'message': str(e)}) from e
     return ChatAnswerResponse(answer=r['answer'], route=r['route'],
                               meta=r.get('meta') or {})

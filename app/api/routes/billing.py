@@ -25,6 +25,10 @@ def _handle(e: Exception) -> HTTPException:
     if isinstance(e, billing.BillingError):
         return HTTPException(status_code=status.HTTP_400_BAD_REQUEST,
                              detail={'code': e.code, 'message': e.message})
+    from app.services.tenant import TenantSuspendedError
+    if isinstance(e, TenantSuspendedError):        # P2-20：停用租户
+        return HTTPException(status_code=status.HTTP_403_FORBIDDEN,
+                             detail={'code': e.code, 'message': str(e)})
     # ★ 未知异常不把内部细节回给客户端（docs/16 P2-14），只进日志
     logger.exception('计费接口未处理异常: %s', e)
     return HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,

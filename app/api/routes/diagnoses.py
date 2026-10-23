@@ -47,6 +47,10 @@ def _handle(e: Exception) -> HTTPException:
             else status.HTTP_400_BAD_REQUEST
         return HTTPException(status_code=code,
                              detail={'code': e.code, 'message': e.message})
+    from app.services.tenant import TenantSuspendedError
+    if isinstance(e, TenantSuspendedError):        # P2-20：停用租户
+        return HTTPException(status_code=status.HTTP_403_FORBIDDEN,
+                             detail={'code': e.code, 'message': str(e)})
     logger.exception('诊断接口未处理异常: %s', e)
     return HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
                          detail={'code': 'INTERNAL',
@@ -197,6 +201,16 @@ _diag_slots = threading.BoundedSemaphore(_MAX_RUNNING_DIAGNOSES)
 def _precheck(tenant_id: str, is_admin: bool,
               source_ids: list[str]) -> None:
     """同步前置校验（在线程池执行，避免阻塞事件循环）。"""
+    # ★ 停用租户同步 403（P2-20）—— service 层 run_diagnosis 还有
+    #   同样的检查兜底，但那里在后台线程里，客户端只能看到 202 后失败。
+    from app.services import tenant as tn
+    try:
+        tn.ensure_tenant_active(tenant_id)
+    except tn.TenantSuspendedError as e:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail={'code': e.code, 'message': str(e)}) from e
+
     # 额度不足直接 402，不浪费线程；超管放行（docs/12：只免额度这一道闸）
     if not is_admin:
         acc = billing.get_account(tenant_id)

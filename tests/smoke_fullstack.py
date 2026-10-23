@@ -51,14 +51,25 @@ st, h = req('GET', '/health')
 print(f'  HTTP {st}  status={h.get("status")}  tables={h.get("database",{}).get("tables")}')
 check('健康检查通过', st == 200 and h.get('status') == 'ok')
 
-# ---------- 2. 注册（用时间戳避免重复）----------
-print('\n[2] 注册')
-email = f'smoke{int(time.time())}@shop.com'
+# ---------- 2. 登录/注册固定冒烟租户 ----------
+# ★ P2-20：原每次冒烟用时间戳邮箱注册新租户（+1 租户/次，目录只增不减）。
+#   改为固定邮箱：首次注册，之后登录同一租户；断言改为相对余额。
+print('\n[2] 冒烟租户就绪（固定，重复复用）')
+SMOKE_EMAIL = 'smoke-main@shop.com'
 st, r = req('POST', '/auth/register', json_body={
-    'email': email, 'password': 'SmokeTest!2026', 'tenant_name': '冒烟测试店'})
-check('注册成功', st == 201, f'HTTP {st}')
+    'email': SMOKE_EMAIL, 'password': 'SmokeTest!2026', 'tenant_name': '冒烟测试店'})
+if st == 409:                                     # 之前冒烟已注册 → 登录
+    st, r = req('POST', '/auth/login', json_body={
+        'email': SMOKE_EMAIL, 'password': 'SmokeTest!2026'})
+check('冒烟租户就绪（注册或登录）', st in (200, 201), f'HTTP {st}')
 TOKEN = r['token']['access_token']
-print(f'  租户 {r["user"]["tenant_id"][:12]}…')
+TENANT_ID = r['user']['tenant_id']
+print(f'  租户 {TENANT_ID[:12]}…')
+
+# 基准余额（相对断言用）
+st, acc0 = req('GET', '/billing/account', TOKEN)
+BALANCE0 = acc0['balance']
+print(f'  当前余额 {BALANCE0}')
 
 # ---------- 3. 购买 ----------
 print('\n[3] 购买 5 次包（人工核销需平台管理员）')
@@ -84,8 +95,8 @@ ADMIN_TOKEN = r['token']['access_token']
 
 st, acc = req('POST', f'/billing/orders/{o["order_no"]}/confirm', ADMIN_TOKEN)
 check('管理员确认收款', st == 200, f'HTTP {st}')
-print(f'  余额 {acc["balance"]}（注册赠送 1 + 购买 5）')
-check('额度到账（1+5=6）', acc['balance'] == 6, acc['balance'])
+print(f'  余额 {acc["balance"]}（原 {BALANCE0} + 购买 5）')
+check('额度到账（+5）', acc['balance'] == BALANCE0 + 5, acc['balance'])
 
 # ---------- 4. 上传 ----------
 print('\n[4] 上传 6 个文件')
@@ -262,9 +273,11 @@ if isinstance(html, str):
 print('\n[10] 额度')
 st, acc = req('GET', '/billing/account', TOKEN)
 print(f'  余额 {acc["balance"]}  已用 {acc["total_used"]}')
-check('扣了 1 次（6→5）', acc['balance'] == 5, acc['balance'])
+check('扣了 1 次（购买后余额 -1）',
+      acc['balance'] == BALANCE0 + 4, acc['balance'])
 st, ledger = req('GET', '/billing/ledger', TOKEN)
 check('有流水记录', len(ledger) >= 2, len(ledger))
+check('流水行带主键 id（P3-22）', all(e.get('id') for e in ledger))
 
 print()
 print('=' * 74)

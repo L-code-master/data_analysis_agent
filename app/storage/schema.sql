@@ -287,6 +287,17 @@ CREATE TABLE IF NOT EXISTS diagnoses (
 CREATE INDEX IF NOT EXISTS idx_diag_tenant ON diagnoses(tenant_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_diag_status ON diagnoses(status);
 
+-- 10.1 诊断-数据源血缘（docs/16 P2-29：diagnoses.source_id 只存首份，
+--      多源诊断的真实输入集合在此关联表落库，报告"基于哪些文件"可查证）
+CREATE TABLE IF NOT EXISTS diagnosis_sources (
+    diagnosis_id  TEXT NOT NULL,
+    source_id     TEXT NOT NULL,
+    source_type   TEXT NOT NULL DEFAULT '',
+    imported_rows INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (diagnosis_id, source_id)
+);
+CREATE INDEX IF NOT EXISTS idx_dsrc_source ON diagnosis_sources(source_id);
+
 -- ---------------------------------------------------------------------------
 -- 10.5 对话式分析（v1.4：形态 A 查数问答 + 形态 B Agent 归因）
 -- ---------------------------------------------------------------------------
@@ -313,6 +324,10 @@ CREATE TABLE IF NOT EXISTS chat_messages (
 );
 CREATE INDEX IF NOT EXISTS idx_chat_msg_session
     ON chat_messages(session_id, created_at);
+-- ★ 租户级查询索引（docs/16 P2-29）：配额统计按 tenant+route 计数，
+--   原先全表扫 session 索引再过滤
+CREATE INDEX IF NOT EXISTS idx_chat_tenant
+    ON chat_messages(tenant_id, created_at DESC);
 
 -- ---------------------------------------------------------------------------
 -- 11. 用量明细（计费与成本核算依据）

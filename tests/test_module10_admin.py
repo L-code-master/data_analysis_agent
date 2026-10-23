@@ -273,6 +273,80 @@ r = client.post('/api/v1/auth/register', json={
     'email': 'noadmin@test.com', 'password': 'NoAdmin!2026x', 'tenant_name': '无管理'})
 check('默认注册均为 owner（功能关闭）', r.json()['user']['role'] == 'owner')
 
+# ---------------------------------------------------------------------------
+print('\n[7] 租户管理：停用/恢复（docs/16 P2-20）')
+os.environ['SUPER_ADMIN_EMAILS'] = 'boss@test.com'
+reset_settings_cache()
+
+# 一个普通租户
+r = client.post('/api/v1/auth/register', json={
+    'email': 'suspend@test.com', 'password': 'Suspend!2026x', 'tenant_name': '待停用店'})
+check('注册待停用租户', r.status_code == 201, r.status_code)
+SUS_TOKEN = r.json()['token']['access_token']
+SUS_TID = r.json()['user']['tenant_id']
+H_SUS = {'Authorization': f'Bearer {SUS_TOKEN}'}
+
+# owner 不能访问管理端
+r = client.get('/api/v1/admin/tenants', headers=H_SUS)
+check('★ owner 访问 /admin/tenants → 403', r.status_code == 403, r.status_code)
+
+# 管理员清单
+r = client.get('/api/v1/admin/tenants', headers=H_ADMIN)
+check('管理员清单 200', r.status_code == 200, r.status_code)
+items = r.json().get('items', [])
+check('清单含待停用租户',
+      any(t['tenant_id'] == SUS_TID for t in items), len(items))
+check('清单含 has_dir 字段', all('has_dir' in t for t in items))
+
+# 停用
+r = client.post(f'/api/v1/admin/tenants/{SUS_TID}/status',
+                headers=H_ADMIN, params={'status': 'suspended'})
+check('★ 停用 200', r.status_code == 200, r.status_code)
+check('状态已生效', r.json().get('status') == 'suspended', r.json())
+
+# 停用后四个写路径全部 403
+r = client.post('/api/v1/sources', headers=H_SUS,
+                files={'file': ('订单.csv', orders, 'text/csv')})
+check('★ 停用后上传 403', r.status_code == 403
+      and r.json().get('code') == 'TENANT_SUSPENDED', r.status_code)
+r = client.post('/api/v1/billing/orders', headers=H_SUS, json={'sku': 'single'})
+check('★ 停用后下单 403', r.status_code == 403
+      and r.json().get('code') == 'TENANT_SUSPENDED', r.status_code)
+r = client.post('/api/v1/chat/sessions', headers=H_SUS,
+                params={'title': '停用测试'})
+check('建会话不受限（读路径）', r.status_code == 201, r.status_code)
+r = client.post(f'/api/v1/chat/sessions/{r.json()["session_id"]}/ask',
+                headers=H_SUS, json={'question': '这个月毛利率多少'})
+check('★ 停用后提问 403', r.status_code == 403
+      and r.json().get('code') == 'TENANT_SUSPENDED', r.status_code)
+r = client.post('/api/v1/diagnoses', headers=H_SUS,
+                json={'source_ids': ['whatever'], 'time_range': '本月'})
+check('★ 停用后诊断 403（同步返回而非 202 后失败）',
+      r.status_code == 403, r.status_code)
+
+# 恢复
+r = client.post(f'/api/v1/admin/tenants/{SUS_TID}/status',
+                headers=H_ADMIN, params={'status': 'active'})
+check('恢复 200', r.status_code == 200, r.status_code)
+r = client.post('/api/v1/sources', headers=H_SUS,
+                files={'file': ('订单.csv', orders, 'text/csv')})
+check('★ 恢复后上传恢复 201', r.status_code == 201, r.status_code)
+
+# 非法状态
+r = client.post(f'/api/v1/admin/tenants/{SUS_TID}/status',
+                headers=H_ADMIN, params={'status': 'bogus'})
+check('非法状态 400', r.status_code == 400, r.status_code)
+
+# ---------------------------------------------------------------------------
+print('\n[8] 版本化迁移 + WAL checkpoint（docs/16 P2-27 / P2-23）')
+with db.get_conn() as conn:
+    vers = [r0[0] for r0 in conn.execute(
+        'SELECT version FROM app_migrations ORDER BY version').fetchall()]
+check('★ app_migrations 已按序应用', vers == [1, 2, 3, 4], vers)
+ck = db.wal_checkpoint('TRUNCATE')
+check('★ wal_checkpoint 正常返回', ck['mode'] == 'TRUNCATE'
+      and 'after' in ck, ck.get('result'))
+
 print()
 print('=' * 78)
 print('模块 10: ' + ('全部通过' if not fails else f'{len(fails)} 项失败 -> {fails}'))

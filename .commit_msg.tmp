@@ -1,0 +1,25 @@
+﻿feat: P2-20/23/27/29 租户治理 + 版本化迁移 + WAL + 血缘表
+
+P2-20 租户状态消费(此前 tenants.status 零消费方, 停用租户照常使用):
+- tenant.py 新增 ensure_tenant_active/list_tenants/set_tenant_status
+- 上传/诊断/对话/下单四个写路径前置检查 -> 403 TENANT_SUSPENDED
+- 诊断路由 _precheck 同步返回 403(不再 202 后线程里失败)
+- admin 端新增租户清单与停用恢复接口
+- 冒烟改固定租户(409->登录), 余额断言改相对值, 不再每次 +1 租户
+
+P2-23 WAL checkpoint:
+- db.wal_checkpoint(TRUNCATE) 助手; 启动 lifespan 在对账后落盘
+- scripts/maintenance.py: check(对账报告)/checkpoint/backup
+  (先落盘再拷贝, 实测 787KB wal -> 收缩)/purge-orphans(默认 dry-run)
+
+P2-27 SQLite 顺序迁移:
+- app_migrations 版本表 + _APP_MIGRATIONS 按序执行;
+  仅容忍 duplicate column(老库旧逻辑补过列), 其余失败必须抛出
+- 收编原硬编码 ALTER 元组; 删除 _initialized_paths 死代码(P3-8)
+
+P2-29 诊断-数据源血缘:
+- diagnosis_sources 关联表(迁移 v4 + schema.sql 同步)
+- run_diagnosis 导入后落血缘行(多源输入集合库内可查证)
+- chat_messages 补租户索引(配额计数不再全表扫)
+
+模块 10 新增 [7] 租户停用/恢复(17 项断言)与 [8] 迁移+checkpoint 验证。

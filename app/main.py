@@ -78,6 +78,15 @@ async def lifespan(app: FastAPI):
         # 对账失败不阻断启动：后续每次诊断失败仍会退款，补偿表保留待重试
         logger.exception('启动对账失败')
 
+    # ★ WAL checkpoint（docs/16 P2-23）：单进程重启时无并发写，
+    #   趁机把 -wal 落回主库（实测曾 462KB 主库挂 4.1MB wal ——
+    #   直接拷贝 app.db 备份会丢最新计费流水）。
+    try:
+        ck = await run_in_threadpool(db.wal_checkpoint, 'TRUNCATE')
+        logger.info('WAL checkpoint: %s', ck)
+    except Exception:                       # noqa: BLE001
+        logger.exception('WAL checkpoint 失败（不影响启动）')
+
     # 确保租户根目录存在
     s.tenants_path.mkdir(parents=True, exist_ok=True)
     s.log_path.mkdir(parents=True, exist_ok=True)

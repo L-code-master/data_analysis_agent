@@ -294,3 +294,78 @@ def tenant_usage(tenant_id: str) -> dict:
         'bytes': total,
         'mb': round(total / 1024 / 1024, 2),
     }
+
+
+# ---------------------------------------------------------------------------
+# 租户状态（docs/16 P2-20）
+# ---------------------------------------------------------------------------
+# tenants.status（active | suspended | closed）此前**零消费方** —— 停用
+# 租户照常上传/诊断/下单。这里提供查询、阻断与管理的唯一入口，
+# 上传/诊断/对话/下单四个写路径前置检查。
+
+STATUS_ACTIVE = 'active'
+STATUS_SUSPENDED = 'suspended'
+STATUS_CLOSED = 'closed'
+_VALID_STATUS = frozenset({STATUS_ACTIVE, STATUS_SUSPENDED, STATUS_CLOSED})
+
+
+class TenantSuspendedError(Exception):
+    """租户已停用/关闭（code 供路由映射为 403）。"""
+
+    def __init__(self, tenant_id: str, status: str = ''):
+        self.tenant_id = tenant_id
+        self.status = status
+        self.code = 'TENANT_SUSPENDED'
+        super().__init__('该账户已被停用，如有疑问请联系客服')
+
+
+def tenant_status(tenant_id: str) -> str:
+    """取租户状态；租户行不存在返回 ''（由调用方决定语义）。"""
+    from app.storage import db          # 局部导入：storage 不依赖 services
+    with db.get_conn() as conn:
+        row = conn.execute('SELECT status FROM tenants WHERE id = ?',
+                           (tenant_id,)).fetchone()
+    return str(row[0]) if row else ''
+
+
+def ensure_tenant_active(tenant_id: str) -> None:
+    """写路径前置检查：非 active 租户一律拒绝（docs/16 P2-20）。"""
+    st = tenant_status(tenant_id)
+    if st and st != STATUS_ACTIVE:
+        raise TenantSuspendedError(tenant_id, st)
+
+
+def list_tenants(limit: int = 200, status: str = '') -> list[dict]:
+    """租户清单（管理端/对账用）。"""
+    from app.storage import db
+    sql = ('SELECT id,name,status,created_at,updated_at FROM tenants')
+    params: list = []
+    if status:
+        sql += ' WHERE status = ?'
+        params.append(status)
+    sql += ' ORDER BY created_at DESC LIMIT ?'
+    params.append(int(limit))
+    with db.get_conn() as conn:
+        rows = conn.execute(sql, params).fetchall()
+    return [{
+        'tenant_id': r[0], 'name': r[1] or '', 'status': r[2],
+        'created_at': r[3], 'updated_at': r[4],
+        'has_dir': tenant_paths(r[0]).root.exists(),
+    } for r in rows]
+
+
+def set_tenant_status(tenant_id: str, new_status: str) -> dict:
+    """停用/恢复租户（仅平台管理端调用）。"""
+    if new_status not in _VALID_STATUS:
+        raise TenantPathError(
+            f'非法状态 {new_status!r}，可选: {", ".join(sorted(_VALID_STATUS))}')
+    import datetime as _dt
+    from app.storage import db
+    now = _dt.datetime.now(_dt.timezone.utc).isoformat()
+    with db.transaction() as conn:
+        cur = conn.execute(
+            'UPDATE tenants SET status = ?, updated_at = ? WHERE id = ?',
+            (new_status, now, tenant_id))
+        if not cur.rowcount:
+            raise TenantPathError(f'租户不存在: {tenant_id}')
+    return {'tenant_id': tenant_id, 'status': new_status, 'updated_at': now}

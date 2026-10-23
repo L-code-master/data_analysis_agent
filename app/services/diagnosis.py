@@ -166,6 +166,7 @@ def register_source(tenant_id: str, user_id: str, original_name: str,
 
     返回创建/更新的数据源列表（CSV 恒为 1 个；多表 Excel 为 N 个）。
     """
+    tn.ensure_tenant_active(tenant_id)      # P2-20：停用租户拒绝上传
     ok, reason = tn.validate_upload(tenant_id, original_name, len(content))
     if not ok:
         raise DiagnosisError(reason, 'UPLOAD_REJECTED')
@@ -510,6 +511,7 @@ def run_diagnosis(tenant_id: str, user_id: str,
 
     # ---- 0. 前置检查 ----
     emit('checking', '检查额度与映射')
+    tn.ensure_tenant_active(tenant_id)      # P2-20：停用租户拒绝诊断
     from app.services import auth as _auth_svc          # 局部导入防循环
     is_admin = False
     try:
@@ -614,6 +616,17 @@ def run_diagnosis(tenant_id: str, user_id: str,
 
         emit('importing', '导入完成: ' + ', '.join(
             f'{k}={v}' for k, v in imported))
+
+        # ★ 诊断-数据源血缘落库（docs/16 P2-29）：diagnoses.source_id 只存
+        #   首份文件，多源诊断的真实输入集合在这里可查证（报告“基于哪些
+        #   文件”不再只活在报告 JSON 里）。
+        with db.transaction() as conn_l:
+            for src, (_spec_key, n) in zip(srcs, imported):
+                conn_l.execute(
+                    'INSERT OR REPLACE INTO diagnosis_sources '
+                    '(diagnosis_id, source_id, source_type, imported_rows) '
+                    'VALUES (?,?,?,?)',
+                    (did, src.id, _spec_key, n))
 
         # ---- 5. ETL ----
         emit('etl', '执行 ETL')

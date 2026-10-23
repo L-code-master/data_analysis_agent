@@ -22,8 +22,6 @@ from typing import Iterator
 from app.config import get_settings
 
 _local = threading.local()
-_init_lock = threading.Lock()
-_initialized_paths: set[str] = set()
 
 # 每个连接都要执行的 PRAGMA
 _PRAGMAS = (
@@ -68,11 +66,6 @@ def get_conn() -> sqlite3.Connection:
     _local.conn = conn
     _local.key = key
 
-    # 首次见到这个库时，确保 schema 已应用
-    with _init_lock:
-        if key not in _initialized_paths:
-            _initialized_paths.add(key)
-
     return conn
 
 
@@ -115,11 +108,11 @@ def close_conn() -> None:
 
 
 def apply_schema(schema_file: Path | None = None) -> None:
-    """应用 schema.sql（幂等）。
+    """应用 schema.sql（幂等）+ 推进顺序迁移。
 
     幂等性两层保障：
       1. 全部 CREATE TABLE IF NOT EXISTS
-      2. 对已存在的旧库，逐个补列（ALTER 失败 = 列已存在，忽略）
+      2. 旧库补丁走 app_migrations 版本表按序执行（见 apply_migrations）
     """
     if schema_file is None:
         # 固定指向项目内的 app/storage/schema.sql（不依赖 DB 路径推导）
@@ -130,31 +123,112 @@ def apply_schema(schema_file: Path | None = None) -> None:
     conn = get_conn()
     conn.executescript(schema_file.read_text(encoding='utf-8'))
 
-    # 旧库迁移：schema.sql 只对新库生效，这里给已有表补列
-    migrations = (
-        "ALTER TABLE sources ADD COLUMN sheet_name TEXT DEFAULT ''",
-        # docs/16 P1-6：额度批次化后，流水要能回指批次（退款回原批次）
-        "ALTER TABLE credit_ledger ADD COLUMN lot_id TEXT",
-        # docs/16 P1-18：access token 撤销水位 / refresh token 轮换族
-        "ALTER TABLE users ADD COLUMN token_valid_after TEXT",
-        "ALTER TABLE refresh_tokens ADD COLUMN family_id TEXT",
-    )
-    for stmt in migrations:
-        try:
-            conn.execute(stmt)
-        except sqlite3.OperationalError:
-            pass          # 列已存在
+    apply_migrations()
 
     # ★ 重建 sources 去重索引（含 sheet_name）。
-    #   顺序必须在 ALTER 之后 —— 一个 Excel 拆出的 6 个数据源
+    #   顺序必须在迁移之后 —— 一个 Excel 拆出的 6 个数据源
     #   共享同一 sha256，必须按 (tenant, sha256, sheet) 去重。
     conn.execute('DROP INDEX IF EXISTS idx_sources_dedup')
     conn.execute(
         "CREATE UNIQUE INDEX IF NOT EXISTS idx_sources_dedup "
         "ON sources(tenant_id, sha256, COALESCE(sheet_name, ''))")
 
-    with _init_lock:
-        _initialized_paths.add(str(_db_path()))
+
+# ---------------------------------------------------------------------------
+# 顺序迁移（docs/16 P2-27）
+# ---------------------------------------------------------------------------
+# 原先靠硬编码 ALTER 元组 + 无差别吞 OperationalError —— 没有版本记录，
+# 旧库停在哪个补丁无从得知，非「列已存在」的真实错误也被吞掉。
+# 现在每次迁移落 app_migrations 版本表；只有明确的「duplicate column」
+# 视为已应用（老版 apply_schema 补过列但没有版本记录），其余失败必须抛出。
+_APP_MIGRATIONS: list[tuple[int, str, list[str]]] = [
+    (1, 'sources 多工作表列',
+     ["ALTER TABLE sources ADD COLUMN sheet_name TEXT DEFAULT ''"]),
+    (2, '额度批次化：流水回指批次（P1-6）',
+     ['ALTER TABLE credit_ledger ADD COLUMN lot_id TEXT']),
+    (3, 'token 撤销水位 + refresh 轮换族（P1-18）',
+     ['ALTER TABLE users ADD COLUMN token_valid_after TEXT',
+      'ALTER TABLE refresh_tokens ADD COLUMN family_id TEXT']),
+    (4, '诊断-数据源血缘表 + chat_messages 租户索引（P2-29）',
+     ['''CREATE TABLE IF NOT EXISTS diagnosis_sources (
+            diagnosis_id  TEXT NOT NULL,
+            source_id     TEXT NOT NULL,
+            source_type   TEXT NOT NULL DEFAULT '',
+            imported_rows INTEGER NOT NULL DEFAULT 0,
+            PRIMARY KEY (diagnosis_id, source_id))''',
+      'CREATE INDEX IF NOT EXISTS idx_dsrc_source '
+      'ON diagnosis_sources(source_id)',
+      'CREATE INDEX IF NOT EXISTS idx_chat_tenant '
+      'ON chat_messages(tenant_id, created_at DESC)']),
+]
+
+
+def _now_iso() -> str:
+    import datetime
+    return datetime.datetime.now(datetime.timezone.utc).isoformat()
+
+
+def _exec_idempotent(conn: sqlite3.Connection, stmts: list[str]) -> None:
+    """执行迁移语句；仅容忍「列已存在」（老库被旧逻辑补过列）。"""
+    for stmt in stmts:
+        try:
+            conn.execute(stmt)
+        except sqlite3.OperationalError as e:
+            if 'duplicate column name' not in str(e).lower():
+                raise
+
+
+def apply_migrations() -> list[int]:
+    """把库推进到最新版本，返回本次应用的版本列表。"""
+    import logging
+    log = logging.getLogger(__name__)
+    conn = get_conn()
+    conn.execute(
+        'CREATE TABLE IF NOT EXISTS app_migrations ('
+        ' version INTEGER PRIMARY KEY, description TEXT,'
+        ' applied_at TEXT NOT NULL)')
+    row = conn.execute(
+        'SELECT COALESCE(MAX(version), 0) FROM app_migrations').fetchone()
+    current = int(row[0] or 0)
+
+    applied: list[int] = []
+    for version, desc, stmts in _APP_MIGRATIONS:
+        if version <= current:
+            continue
+        with transaction():
+            _exec_idempotent(conn, stmts)
+            conn.execute(
+                'INSERT INTO app_migrations (version, description, applied_at) '
+                'VALUES (?, ?, ?)', (version, desc, _now_iso()))
+        applied.append(version)
+        log.info('应用库迁移 v%d：%s', version, desc)
+    return applied
+
+
+# ---------------------------------------------------------------------------
+# WAL checkpoint（docs/16 P2-23）
+# ---------------------------------------------------------------------------
+
+def _wal_sizes() -> dict:
+    dbp = _db_path()
+    wal = dbp.parent / (dbp.name + '-wal')
+    return {
+        'db_bytes': dbp.stat().st_size if dbp.exists() else 0,
+        'wal_bytes': wal.stat().st_size if wal.exists() else 0,
+    }
+
+
+def wal_checkpoint(mode: str = 'TRUNCATE') -> dict:
+    """手工 checkpoint。
+
+    WAL 只增不 checkpoint 时（实测 app.db 462KB 而 -wal 4.1MB），
+    直接拷贝 app.db 备份会丢最新计费流水。启动对账与备份脚本调用。
+    """
+    conn = get_conn()
+    before = _wal_sizes()
+    row = conn.execute(f'PRAGMA wal_checkpoint({mode})').fetchone()
+    return {'mode': mode, 'result': list(row or ()),
+            'before': before, 'after': _wal_sizes()}
 
 
 def health_check() -> dict:

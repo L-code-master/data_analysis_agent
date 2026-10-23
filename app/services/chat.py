@@ -279,6 +279,10 @@ def ask(tenant_id: str, user_id: str, session_id: str,
     if get_session(tenant_id, session_id) is None:
         return {'answer': '会话不存在', 'route': 'error', 'meta': {}}
 
+    # P2-20：停用租户拒绝对话（qa 查数也一样 —— 不给停用账户任何服务面）
+    from app.services import tenant as _tn
+    _tn.ensure_tenant_active(tenant_id)
+
     history: list[dict] = []
 
     # ---- 第一段（持租户锁）：语义层 + 形态 A ----

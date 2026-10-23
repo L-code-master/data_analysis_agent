@@ -83,3 +83,33 @@ def writeoff_refund(ctx: Ctx, pending_id: str, note: str = ''):
         return billing.writeoff_refund_pending(pending_id, note=note)
     except Exception as e:                      # noqa: BLE001
         raise _handle(e) from e
+
+
+# ---------------------------------------------------------------------------
+# 租户管理（docs/16 P2-20：tenants.status 此前零消费方）
+# ---------------------------------------------------------------------------
+
+@router.get('/tenants', summary='租户清单（含磁盘目录有无）')
+def list_tenants(ctx: Ctx, status: str = '', limit: int = 200):
+    """平台管理员查看租户与状态；配合 POST /status 停用/恢复。"""
+    _require_admin(ctx)
+    from app.services import tenant as tn
+    return {'items': tn.list_tenants(limit=limit, status=status)}
+
+
+@router.post('/tenants/{tenant_id}/status', summary='停用/恢复租户')
+def set_tenant_status(ctx: Ctx, tenant_id: str, status: str):
+    """status: active | suspended | closed。
+
+    停用后该租户的上传/诊断/对话/下单全部 403（docs/16 P2-20）；
+    已有订单的核销与退款不受影响。
+    """
+    _require_admin(ctx)
+    from app.services import tenant as tn
+    try:
+        return tn.set_tenant_status(tenant_id, status)
+    except tn.TenantPathError as e:
+        # 参数 status 遮蔽了 fastapi.status 模块，这里用数字字面量
+        raise HTTPException(status_code=400,
+                            detail={'code': 'BAD_TENANT_STATUS',
+                                    'message': str(e)}) from e
