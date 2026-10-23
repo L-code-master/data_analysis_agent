@@ -1022,16 +1022,19 @@ def check_cost_quota(tenant_id: str) -> tuple[bool, str]:
 def list_ledger(tenant_id: str, limit: int = 100) -> list[dict]:
     with db.get_conn() as conn:
         rows = conn.execute(
-            'SELECT delta,balance_after,reason,note,created_at,expires_at '
+            'SELECT id,delta,balance_after,reason,note,created_at,expires_at '
             'FROM credit_ledger WHERE tenant_id = ? '
             'ORDER BY created_at DESC LIMIT ?', (tenant_id, int(limit))).fetchall()
     return [{
-        'delta': _row_get(r, 'delta', 0),
-        'balance_after': _row_get(r, 'balance_after', 1),
-        'reason': _row_get(r, 'reason', 2),
-        'note': _row_get(r, 'note', 3) or '',
-        'created_at': _row_get(r, 'created_at', 4),
-        'expires_at': _row_get(r, 'expires_at', 5) or '',
+        # ★ 行主键必须返回（docs/16 P3-22）：前端原先用
+        #   created_at+delta 拼 key，同秒同额度会撞 key 导致渲染错行。
+        'id': _row_get(r, 'id', 0),
+        'delta': _row_get(r, 'delta', 1),
+        'balance_after': _row_get(r, 'balance_after', 2),
+        'reason': _row_get(r, 'reason', 3),
+        'note': _row_get(r, 'note', 4) or '',
+        'created_at': _row_get(r, 'created_at', 5),
+        'expires_at': _row_get(r, 'expires_at', 6) or '',
     } for r in rows]
 
 

@@ -25,8 +25,10 @@ export default function AppLayout() {
 
   useEffect(() => {
     loadBalance()
-    // 额度变化后刷新（简单起见按时轮询）
-    const t = setInterval(loadBalance, 15000)
+    // 额度变化后刷新（简单起见按时轮询；后台标签页不打扰 —— P3-24）
+    const t = setInterval(() => {
+      if (document.visibilityState === 'visible') loadBalance()
+    }, 15000)
     return () => clearInterval(t)
   }, [location.pathname])
 

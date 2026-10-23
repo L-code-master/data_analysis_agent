@@ -1,29 +1,38 @@
+import { lazy, Suspense } from 'react'
 import { Navigate, Route, Routes, useLocation } from 'react-router-dom'
 import { Spin } from 'antd'
 import { AuthProvider, useAuth } from './stores/auth'
 import AppLayout from './components/AppLayout'
-import LoginPage from './pages/Login'
-import RegisterPage from './pages/Register'
-import VerifyEmailPage from './pages/VerifyEmail'
-import DashboardPage from './pages/Dashboard'
-import UploadPage from './pages/Upload'
-import MappingPage from './pages/Mapping'
-import ProgressPage from './pages/Progress'
-import ReportPage from './pages/Report'
-import BillingPage from './pages/Billing'
-import SettingsPage from './pages/Settings'
-import ChatPage from './pages/Chat'
+
+// ★ 路由级代码分割（docs/16 P3-18）：原先是单一 1260KB chunk，
+//   全部页面静态 import。按路由 lazy 拆分 + vite manualChunks
+//   分离体积大户（antd / 图表 / React 核心），首屏只加载登录页所需。
+const LoginPage = lazy(() => import('./pages/Login'))
+const RegisterPage = lazy(() => import('./pages/Register'))
+const VerifyEmailPage = lazy(() => import('./pages/VerifyEmail'))
+const DashboardPage = lazy(() => import('./pages/Dashboard'))
+const UploadPage = lazy(() => import('./pages/Upload'))
+const MappingPage = lazy(() => import('./pages/Mapping'))
+const ProgressPage = lazy(() => import('./pages/Progress'))
+const ReportPage = lazy(() => import('./pages/Report'))
+const BillingPage = lazy(() => import('./pages/Billing'))
+const SettingsPage = lazy(() => import('./pages/Settings'))
+const ChatPage = lazy(() => import('./pages/Chat'))
+
+function PageLoading() {
+  return (
+    <div style={{ display: 'flex', justifyContent: 'center', paddingTop: 120 }}>
+      <Spin size="large" />
+    </div>
+  )
+}
 
 function RequireAuth({ children }: { children: React.ReactNode }) {
   const { user, initialized } = useAuth()
   const location = useLocation()
 
   if (!initialized) {
-    return (
-      <div style={{ display: 'flex', justifyContent: 'center', paddingTop: 160 }}>
-        <Spin size="large" />
-      </div>
-    )
+    return <PageLoading />
   }
   if (!user) {
     return <Navigate to="/login" state={{ from: location.pathname }} replace />
@@ -31,12 +40,17 @@ function RequireAuth({ children }: { children: React.ReactNode }) {
   return <>{children}</>
 }
 
+/** lazy 页面统一包一层 Suspense。 */
+function Lazy({ children }: { children: React.ReactNode }) {
+  return <Suspense fallback={<PageLoading />}>{children}</Suspense>
+}
+
 function AppRoutes() {
   return (
     <Routes>
-      <Route path="/login" element={<LoginPage />} />
-      <Route path="/register" element={<RegisterPage />} />
-      <Route path="/verify-email" element={<VerifyEmailPage />} />
+      <Route path="/login" element={<Lazy><LoginPage /></Lazy>} />
+      <Route path="/register" element={<Lazy><RegisterPage /></Lazy>} />
+      <Route path="/verify-email" element={<Lazy><VerifyEmailPage /></Lazy>} />
 
       <Route
         path="/"
@@ -47,14 +61,14 @@ function AppRoutes() {
         }
       >
         <Route index element={<Navigate to="/dashboard" replace />} />
-        <Route path="dashboard" element={<DashboardPage />} />
-        <Route path="upload" element={<UploadPage />} />
-        <Route path="mapping/:sourceId" element={<MappingPage />} />
-        <Route path="progress/:diagnosisId" element={<ProgressPage />} />
-        <Route path="report/:diagnosisId" element={<ReportPage />} />
-        <Route path="billing" element={<BillingPage />} />
-        <Route path="settings" element={<SettingsPage />} />
-        <Route path="chat" element={<ChatPage />} />
+        <Route path="dashboard" element={<Lazy><DashboardPage /></Lazy>} />
+        <Route path="upload" element={<Lazy><UploadPage /></Lazy>} />
+        <Route path="mapping/:sourceId" element={<Lazy><MappingPage /></Lazy>} />
+        <Route path="progress/:diagnosisId" element={<Lazy><ProgressPage /></Lazy>} />
+        <Route path="report/:diagnosisId" element={<Lazy><ReportPage /></Lazy>} />
+        <Route path="billing" element={<Lazy><BillingPage /></Lazy>} />
+        <Route path="settings" element={<Lazy><SettingsPage /></Lazy>} />
+        <Route path="chat" element={<Lazy><ChatPage /></Lazy>} />
       </Route>
 
       <Route path="*" element={<Navigate to="/dashboard" replace />} />

@@ -16,6 +16,8 @@ const ROUTE_TAG: Record<string, { text: string; color: string }> = {
   agent: { text: 'Agent 分析', color: 'purple' },
   agent_error: { text: 'Agent 出错', color: 'red' },
   no_llm: { text: '未配置 LLM', color: 'orange' },
+  clarify: { text: '请澄清口径', color: 'gold' },
+  local_error: { text: '发送失败', color: 'red' },
 }
 
 /**
@@ -33,6 +35,7 @@ export default function ChatPage() {
   const [input, setInput] = useState('')
   const [asking, setAsking] = useState(false)
   const [ctx, setCtx] = useState<ChatContext | null>(null)
+  const [sessionsError, setSessionsError] = useState('')
   const bottomRef = useRef<HTMLDivElement>(null)
   // ★ 当前会话 ID 的同步副本：慢响应回来时据此判断是否已切换会话
   const activeIdRef = useRef('')
@@ -45,9 +48,11 @@ export default function ChatPage() {
     })
   }
 
-  useEffect(() => {
-    refreshCtx()
+  const loadSessions = () => {
+    // ★ P2-33：会话列表加载失败不再静默 —— 原先 catch(() => {}) 后
+    //   active 恒为 null，输入框永久禁用且无任何提示。
     chatApi.sessions().then(async (list) => {
+      setSessionsError('')
       setSessions(list)
       if (list.length > 0) {
         setActive(list[0])
@@ -55,7 +60,13 @@ export default function ChatPage() {
         const m = await chatApi.messages(list[0].session_id)
         if (activeIdRef.current === list[0].session_id) setMsgs(m)
       }
-    }).catch(() => {})
+    }).catch((e) => setSessionsError(errMsg(e)))
+  }
+
+  useEffect(() => {
+    refreshCtx()
+    loadSessions()
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
 
   useEffect(() => {
@@ -86,11 +97,11 @@ export default function ChatPage() {
     }
   }
 
-  const send = async () => {
-    const q = input.trim()
+  /** 发起提问（P2-36：失败时消息内联标红并支持重试，而不是只弹 toast）。 */
+  const doAsk = async (rawQ: string) => {
+    const q = rawQ.trim()
     if (!q || !active || asking) return
     const sid = active.session_id
-    setInput('')
     setAsking(true)
     setMsgs((prev) => [...prev, {
       message_id: `local-${Date.now()}`, role: 'user', content: q,
@@ -112,12 +123,25 @@ export default function ChatPage() {
       const err = e as { response?: { status?: number; data?: { message?: string } } }
       if (err?.response?.status === 402) {
         message.warning(err.response.data?.message || 'Agent 追问次数已用完')
-      } else {
-        message.error(errMsg(e))
+      } else if (activeIdRef.current === sid) {
+        // ★ P2-36：错误与具体问题关联 —— 失败消息留在原地，可一键重试
+        setMsgs((prev) => [...prev, {
+          message_id: `local-err-${Date.now()}`, role: 'assistant',
+          content: errMsg(e), route: 'local_error',
+          meta: { question: q },
+          created_at: new Date().toISOString(),
+        }])
       }
     } finally {
       setAsking(false)
     }
+  }
+
+  const send = async () => {
+    const q = input.trim()
+    if (!q) return
+    setInput('')
+    await doAsk(q)
   }
 
   const suggestions = [
@@ -137,6 +161,18 @@ export default function ChatPage() {
         }
       >
         {/* 数据上下文条：对话基于哪份数据（docs/15） */}
+        {sessionsError && (
+          <Alert
+            type="error" showIcon style={{ marginBottom: 12 }}
+            message="会话列表加载失败"
+            description={
+              <Space>
+                <span>{sessionsError}</span>
+                <Button size="small" onClick={loadSessions}>重试</Button>
+              </Space>
+            }
+          />
+        )}
         {ctx && !ctx.data.available && (
           <Alert type="info" showIcon icon={<DatabaseOutlined />}
                  style={{ marginBottom: 12 }}
@@ -213,12 +249,24 @@ export default function ChatPage() {
                 : <RobotOutlined style={{ fontSize: 18, color: '#2c6e49', marginTop: 4 }} />}
               <div style={{ flex: 1, minWidth: 0 }}>
                 <div style={{
-                  background: m.role === 'user' ? '#f6f8fa' : '#f0f9f1',
-                  border: `1px solid ${m.role === 'user' ? '#eceef1' : '#d4e8da'}`,
+                  background: m.role === 'user' ? '#f6f8fa'
+                    : m.route === 'local_error' ? '#fff1f0' : '#f0f9f1',
+                  border: `1px solid ${m.role === 'user' ? '#eceef1'
+                    : m.route === 'local_error' ? '#ffccc7' : '#d4e8da'}`,
                   borderRadius: 10, padding: '10px 14px',
                   whiteSpace: 'pre-wrap', fontSize: 14, lineHeight: 1.7,
                 }}>
                   {m.content}
+                  {m.route === 'local_error' && (
+                    <div style={{ marginTop: 8 }}>
+                      <Button
+                        size="small" danger
+                        onClick={() => doAsk(String(m.meta?.question ?? ''))}
+                      >
+                        重试此问题
+                      </Button>
+                    </div>
+                  )}
                 </div>
                 {m.role === 'assistant' && m.route && ROUTE_TAG[m.route] && (
                   <Space size={8} style={{ marginTop: 4 }}>

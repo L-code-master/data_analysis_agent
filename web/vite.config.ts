@@ -26,6 +26,18 @@ export default defineConfig({
   build: {
     outDir: 'dist',
     sourcemap: false,
-    chunkSizeWarningLimit: 1200,
+    // P3-18：路由已 React.lazy 拆分，恢复默认告警阈值（原 1200 是
+    // 为单一 1260KB chunk 抬高阈值掩盖问题）
+    chunkSizeWarningLimit: 600,
+    rollupOptions: {
+      output: {
+        manualChunks: {
+          // 体积大户独立分包，利用浏览器缓存（业务代码改动不再让
+          // antd/React 整包失效）
+          'antd': ['antd', '@ant-design/icons'],
+          'react': ['react', 'react-dom', 'react-router-dom'],
+        },
+      },
+    },
   },
 })

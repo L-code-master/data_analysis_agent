@@ -69,7 +69,9 @@ export default function DashboardPage() {
         </Col>
         <Col span={6}>
           <Card variant="borderless">
-            <Statistic title="已完成报告" value={succeeded} suffix="份" />
+            {/* P2-35：列表只取最近 20 条，统计口径必须如实标注，
+                避免与"累计诊断"的口径混淆 */}
+            <Statistic title="已完成报告（近 20 次）" value={succeeded} suffix="份" />
           </Card>
         </Col>
         <Col span={6}>

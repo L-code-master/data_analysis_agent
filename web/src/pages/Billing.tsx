@@ -92,14 +92,24 @@ export default function BillingPage() {
     })
   }
 
-  const cancel = async (orderNo: string) => {
-    try {
-      await billingApi.cancelOrder(orderNo)
-      message.success('订单已取消')
-      await load()
-    } catch (e) {
-      message.error(errMsg(e))
-    }
+  /** ★ P2-34：取消订单加确认弹窗 + 防重复点击（原直接发请求可连点）。 */
+  const cancel = (orderNo: string) => {
+    modal.confirm({
+      title: '取消该订单？',
+      content: `订单号 ${orderNo}，取消后如需购买请重新下单。`,
+      okText: '取消订单',
+      okButtonProps: { danger: true },
+      cancelText: '保留',
+      onOk: async () => {
+        try {
+          await billingApi.cancelOrder(orderNo)
+          message.success('订单已取消')
+          await load()
+        } catch (e) {
+          message.error(errMsg(e))
+        }
+      },
+    })
   }
 
   return (
@@ -219,7 +229,7 @@ export default function BillingPage() {
 
       <Card variant="borderless" title="额度流水" style={{ marginTop: 16 }}>
         <Table<LedgerEntry>
-          rowKey={(r) => `${r.created_at}-${r.delta}`}
+          rowKey="id"
           dataSource={ledger}
           loading={loading}
           pagination={{ pageSize: 10, size: 'small' }}

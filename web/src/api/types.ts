@@ -190,6 +190,8 @@ export interface OrderInfo {
 }
 
 export interface LedgerEntry {
+  /** 流水行主键（同秒同额度的行不再撞 key） */
+  id: string
   delta: number
   balance_after: number
   reason: string

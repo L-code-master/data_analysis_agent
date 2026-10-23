@@ -18,10 +18,20 @@ export default function SettingsPage() {
   const [healthDetail, setHealthDetail] = useState<any>(null)
   const [saving, setSaving] = useState(false)
   const [resending, setResending] = useState(false)
+  const [loadError, setLoadError] = useState('')
+
+  const loadAccount = () => {
+    // ★ P2-33：账户信息加载失败不再被吞掉（否则"剩余次数"永远显示 —）
+    billingApi.account().then((a) => {
+      setAccount(a)
+      setLoadError('')
+    }).catch((e) => setLoadError(errMsg(e)))
+  }
 
   useEffect(() => {
-    billingApi.account().then(setAccount).catch(() => {})
-    healthApi.check().then(setHealth).catch(() => {})
+    loadAccount()
+    healthApi.check().then(setHealth).catch(() => setHealth(null))
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
 
   useEffect(() => {
@@ -78,6 +88,18 @@ export default function SettingsPage() {
       )}
 
       <Card variant="borderless" title="账户信息">
+        {loadError && (
+          <Alert
+            type="error" showIcon closable style={{ marginBottom: 12 }}
+            message="账户信息加载失败"
+            description={(
+              <Space>
+                <span>{loadError}</span>
+                <Button size="small" onClick={loadAccount}>重试</Button>
+              </Space>
+            )}
+          />
+        )}
         <Descriptions column={1} size="small">
           <Descriptions.Item label="邮箱">
             {user?.email}

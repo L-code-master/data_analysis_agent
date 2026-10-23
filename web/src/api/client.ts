@@ -80,12 +80,20 @@ async function doRefresh(): Promise<string> {
   return data.access_token
 }
 
+// 认证端点自身的 401 = 密码错误/未注册等业务结果，不是会话过期
+// （docs/16 P2-31）—— 不能触发"刷新令牌 + 跳登录页"，否则输错一次
+// 密码就被无谓地重定向。
+const AUTH_ENDPOINTS = ['/auth/login', '/auth/register', '/auth/verify-email',
+  '/auth/refresh', '/auth/resend-verification']
+
 http.interceptors.response.use(
   (r) => r,
   async (error: AxiosError) => {
     const original = error.config as InternalAxiosRequestConfig & { _retried?: boolean }
+    const isAuthEndpoint = AUTH_ENDPOINTS.some((p) => original?.url?.includes(p))
 
-    if (error.response?.status === 401 && original && !original._retried) {
+    if (error.response?.status === 401 && original && !original._retried
+        && !isAuthEndpoint) {
       original._retried = true
       try {
         // ★ 并发 401 只刷新一次
@@ -190,12 +198,21 @@ export const authApi = {
 // ---------------------------------------------------------------------------
 
 export const sourceApi = {
-  /** 上传文件。★ 多工作表 Excel 会被自动拆分为多个数据源（返回数组）。 */
-  async upload(file: File) {
+  /**
+   * 上传文件。★ 多工作表 Excel 会被自动拆分为多个数据源（返回数组）。
+   * 大文件不走全局 60s 超时（docs/16 P2-32），并支持上传进度回调。
+   */
+  async upload(file: File, onProgress?: (percent: number) => void) {
     const fd = new FormData()
     fd.append('file', file)
     const { data } = await http.post<SourceInfo[]>('/sources', fd, {
       headers: { 'Content-Type': 'multipart/form-data' },
+      timeout: 0,                       // 上传不限时（原受 60s 全局超时威胁）
+      onUploadProgress: onProgress
+        ? (e) => {
+            if (e.total) onProgress(Math.round((e.loaded / e.total) * 100))
+          }
+        : undefined,
     })
     return data
   },
