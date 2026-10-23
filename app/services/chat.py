@@ -15,9 +15,10 @@ from app.config import get_settings
 from app.storage import db
 from app.services.agent_engine import AgentEngine, build_tools
 from app.services.llm_client import LlmClient
+from app.services import billing, locks
 from app.services.qa_engine import NeedsAgentError, QaAnswer, QaEngine
 from app.semantic.registry import SemanticRegistry
-from app.services.diagnosis import _apply_semantic_upgrades, _open_semantic_db
+from app.services.diagnosis import _open_semantic_db
 
 
 def _now() -> str:
@@ -181,6 +182,14 @@ class AgentQuotaExceededError(Exception):
             f'每获得 1 次诊断额度附送 5 次追问；查数类问题仍然免费。')
 
 
+class CostQuotaExceededError(Exception):
+    """本月 LLM 成本熔断（docs/16 P1-7：chat 路径此前完全不检查）。"""
+
+    def __init__(self, message: str):
+        self.message = message
+        super().__init__(message)
+
+
 def agent_chat_quota(tenant_id: str) -> tuple[int, int]:
     """返回 (配额, 已用)。配额 -1 = 不限。
 
@@ -228,6 +237,12 @@ def ask(tenant_id: str, user_id: str, session_id: str,
     路由：形态 A（确定性查数）优先；NeedsAgentError → 形态 B（LLM 循环）。
     配额：仅形态 B 受限（每获得 1 次诊断额度附送 AGENT_CHATS_PER_CREDIT 次）；
     被配额拒绝的问题不落库。
+
+    ★ 并发纪律（docs/16 P0-7）：DuckDB 只在持租户锁期间使用。
+      第一段（持锁）：开库 + 升级补丁 + 形态 A 查数，结束即关连接放锁；
+      第二段（放锁）：Agent 循环的 LLM 调用不占锁 —— 每次工具调用
+      单独短持锁（开连接 → 查询 → 关连接），避免数十秒的 LLM 往返
+      饿死同租户的诊断请求。
     """
     question = (question or '').strip()
     if not question:
@@ -236,70 +251,100 @@ def ask(tenant_id: str, user_id: str, session_id: str,
     if get_session(tenant_id, session_id) is None:
         return {'answer': '会话不存在', 'route': 'error', 'meta': {}}
 
-    con = _open_semantic_db(tenant_id)
-    try:
-        _apply_semantic_upgrades(con)
-        reg = SemanticRegistry(con)
-        reg.load()
+    history: list[dict] = []
 
-        # ---- 形态 A：查数（零 LLM，永不限流）----
-        qa = QaEngine(con, reg)
+    # ---- 第一段（持租户锁）：语义层 + 形态 A ----
+    with locks.tenant_lock(tenant_id):
+        # _open_semantic_db 已按版本迁移（只落后时执行一次，docs/16 P1-12/16）
+        con = _open_semantic_db(tenant_id)
         try:
-            a: QaAnswer = qa.answer(question)
-            _save_message(session_id, tenant_id, 'user', question)
-            _save_message(session_id, tenant_id, 'assistant', a.text,
-                          route='qa', meta=a.meta)
-            return {'answer': a.text, 'route': 'qa', 'meta': a.meta}
-        except NeedsAgentError as reason:
-            # ---- 配额检查（admin 不受限；被拒不落库）----
-            if not _is_admin_user(user_id):
-                quota, used = agent_chat_quota(tenant_id)
-                if quota >= 0 and used >= quota:
-                    raise AgentQuotaExceededError(quota, used)
+            reg = SemanticRegistry(con)
+            reg.load()
 
-            if not get_settings().llm_api_key:
-                text = (f'该问题需要多步分析（{reason}），但当前未配置 LLM。'
-                        f'试试查数类问题，如"这个月毛利率多少""哪个商品退款率高"。')
+            # ---- 形态 A：查数（零 LLM，永不限流）----
+            qa = QaEngine(con, reg)
+            try:
+                a: QaAnswer = qa.answer(question)
                 _save_message(session_id, tenant_id, 'user', question)
-                _save_message(session_id, tenant_id, 'assistant', text,
-                              route='no_llm')
-                return {'answer': text, 'route': 'no_llm', 'meta': {}}
+                _save_message(session_id, tenant_id, 'assistant', a.text,
+                              route='qa', meta=a.meta)
+                return {'answer': a.text, 'route': 'qa', 'meta': a.meta}
+            except NeedsAgentError as reason:
+                # ---- 配额检查（admin 不受限；被拒不落库）----
+                if not _is_admin_user(user_id):
+                    quota, used = agent_chat_quota(tenant_id)
+                    if quota >= 0 and used >= quota:
+                        raise AgentQuotaExceededError(quota, used)
 
-            _save_message(session_id, tenant_id, 'user', question)
-            history = [{'role': m['role'], 'content': m['content']}
-                       for m in list_messages(tenant_id, session_id)[:-1]
-                       if m['role'] in ('user', 'assistant')]
+                if not get_settings().llm_api_key:
+                    text = (f'该问题需要多步分析（{reason}），但当前未配置 LLM。'
+                            f'试试查数类问题，如"这个月毛利率多少""哪个商品退款率高"。')
+                    _save_message(session_id, tenant_id, 'user', question)
+                    _save_message(session_id, tenant_id, 'assistant', text,
+                                  route='no_llm')
+                    return {'answer': text, 'route': 'no_llm', 'meta': {}}
 
-            ctx = get_data_context(tenant_id)
+                # ★ 成本熔断（docs/16 P1-7）：诊断入口有 check_cost_quota，
+                #   chat 的 Agent 循环此前完全不检查 —— 可绕过月上限烧 LLM。
+                ok, cost_reason = billing.check_cost_quota(tenant_id)
+                if not ok:
+                    raise CostQuotaExceededError(cost_reason)
 
-            def con_getter():
-                return con
+                _save_message(session_id, tenant_id, 'user', question)
+                history = [{'role': m['role'], 'content': m['content']}
+                           for m in list_messages(tenant_id, session_id)[:-1]
+                           if m['role'] in ('user', 'assistant')]
+        finally:
+            try:
+                con.close()
+            except Exception:                       # noqa: BLE001
+                pass
 
-            spec, impl = build_tools(reg, con_getter)
-            engine = AgentEngine(LlmClient(), tenant_id, spec, impl)
-            res = engine.run(question, history=history,
-                             data_context=_data_context_prompt(ctx))
+    # ---- 第二段（已放锁）：Agent 循环（LLM 调用不占锁）----
+    ctx = get_data_context(tenant_id)
 
-            if res.error and not res.answer:
-                text = f'分析失败：{res.error}'
-                route = 'agent_error'
-            else:
-                text = res.answer
-                route = 'agent'
-            meta = {'tool_trace': res.tool_trace, 'turns': res.turns,
-                    'cost_usd': res.cost_usd,
-                    'tokens': {'in': res.input_tokens, 'out': res.output_tokens,
-                               'reasoning': res.reasoning_tokens},
-                    'guard_warnings': res.guard_warnings,
-                    'data_context': {
-                        'files': ctx.get('files', []),
-                        'time_range': ctx.get('time_range', ''),
-                    } if ctx.get('available') else {}}
-            _save_message(session_id, tenant_id, 'assistant', text,
-                          route=route, meta=meta)
-            return {'answer': text, 'route': route, 'meta': meta}
-    finally:
-        try:
-            con.close()
-        except Exception:                           # noqa: BLE001
-            pass
+    # 工具用完即关的连接池：con_getter 开的连接由 _locked 包装层回收
+    opened: list = []
+
+    def con_getter():
+        c = _open_semantic_db(tenant_id)
+        opened.append(c)
+        return c
+
+    def _locked(fn):
+        def call(args: dict) -> str:
+            with locks.tenant_lock(tenant_id):
+                try:
+                    return fn(args)
+                finally:
+                    while opened:
+                        try:
+                            opened.pop().close()
+                        except Exception:           # noqa: BLE001
+                            pass
+        return call
+
+    spec, impl = build_tools(reg, con_getter)
+    impl = {name: _locked(fn) for name, fn in impl.items()}
+    engine = AgentEngine(LlmClient(), tenant_id, spec, impl)
+    res = engine.run(question, history=history,
+                     data_context=_data_context_prompt(ctx))
+
+    if res.error and not res.answer:
+        text = f'分析失败：{res.error}'
+        route = 'agent_error'
+    else:
+        text = res.answer
+        route = 'agent'
+    meta = {'tool_trace': res.tool_trace, 'turns': res.turns,
+            'cost_usd': res.cost_usd,
+            'tokens': {'in': res.input_tokens, 'out': res.output_tokens,
+                       'reasoning': res.reasoning_tokens},
+            'guard_warnings': res.guard_warnings,
+            'data_context': {
+                'files': ctx.get('files', []),
+                'time_range': ctx.get('time_range', ''),
+            } if ctx.get('available') else {}}
+    _save_message(session_id, tenant_id, 'assistant', text,
+                  route=route, meta=meta)
+    return {'answer': text, 'route': route, 'meta': meta}

@@ -50,6 +50,9 @@ class LlmClient:
         self.api_key = api_key or s.llm_api_key
         self.base_url = (base_url or s.llm_base_url).rstrip('/')
         self.model = model or s.llm_model
+        # ★ 单次调用超时（docs/16 P1-13）：旧值 120s × 重试 × 8 轮
+        #   最坏可拖到一小时，把整个 Agent 请求挂死。
+        self.timeout = s.llm_timeout_seconds
         self.http = session or requests.Session()
 
     # ------------------------------------------------------------------
@@ -83,7 +86,7 @@ class LlmClient:
                 resp = self.http.post(
                     f'{self.base_url}/chat/completions',
                     headers={'Authorization': f'Bearer {self.api_key}'},
-                    json=payload, timeout=120)
+                    json=payload, timeout=self.timeout)
             except requests.RequestException as e:
                 last_err = e
                 continue                     # 网络错误 → 重试

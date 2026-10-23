@@ -9,18 +9,26 @@ import { authApi, billingApi, errMsg, healthApi } from '../api/client'
 import type { AccountInfo } from '../api/types'
 
 export default function SettingsPage() {
-  const { user, logout } = useAuth()
+  const { user, logout, refresh } = useAuth()
   const navigate = useNavigate()
   const { message } = AntApp.useApp()
   const [form] = Form.useForm()
   const [account, setAccount] = useState<AccountInfo | null>(null)
   const [health, setHealth] = useState<any>(null)
+  const [healthDetail, setHealthDetail] = useState<any>(null)
   const [saving, setSaving] = useState(false)
+  const [resending, setResending] = useState(false)
 
   useEffect(() => {
     billingApi.account().then(setAccount).catch(() => {})
     healthApi.check().then(setHealth).catch(() => {})
   }, [])
+
+  useEffect(() => {
+    if (user?.role === 'admin') {
+      healthApi.detail().then(setHealthDetail).catch(() => {})
+    }
+  }, [user?.role])
 
   const changePassword = async (v: { old_password: string; new_password: string }) => {
     setSaving(true)
@@ -28,7 +36,7 @@ export default function SettingsPage() {
       await authApi.changePassword(v.old_password, v.new_password)
       message.success('密码已修改，请重新登录')
       form.resetFields()
-      setTimeout(() => { void logout(); navigate('/login') }, 800)
+      setTimeout(() => { logout().finally(() => navigate('/login')) }, 800)
     } catch (e) {
       message.error(errMsg(e))
     } finally {
@@ -36,11 +44,47 @@ export default function SettingsPage() {
     }
   }
 
+  const resendVerification = async () => {
+    setResending(true)
+    try {
+      await authApi.resendVerification()
+      message.success('验证邮件已重新发送，请查收')
+      await refresh()
+    } catch (e) {
+      message.error(errMsg(e))
+    } finally {
+      setResending(false)
+    }
+  }
+
   return (
     <div className="page-narrow">
+      {user && user.email_verified === false && (
+        <Alert
+          type="warning"
+          showIcon
+          style={{ marginBottom: 16 }}
+          message="邮箱尚未验证"
+          description={(
+            <Space direction="vertical" size={8}>
+              <span>完成邮箱验证后才会发放注册赠送的诊断次数。</span>
+              <Button size="small" type="primary" loading={resending}
+                      onClick={resendVerification}>
+                重新发送验证邮件
+              </Button>
+            </Space>
+          )}
+        />
+      )}
+
       <Card variant="borderless" title="账户信息">
         <Descriptions column={1} size="small">
-          <Descriptions.Item label="邮箱">{user?.email}</Descriptions.Item>
+          <Descriptions.Item label="邮箱">
+            {user?.email}
+            {user?.email_verified === false
+              ? <Tag color="orange" style={{ marginLeft: 8 }}>未验证</Tag>
+              : <Tag color="green" style={{ marginLeft: 8 }}>已验证</Tag>}
+          </Descriptions.Item>
           <Descriptions.Item label="店铺">{user?.display_name || '—'}</Descriptions.Item>
           <Descriptions.Item label="角色">
             <Tag color={user?.role === 'owner' ? 'green' : 'default'}>
@@ -94,15 +138,25 @@ export default function SettingsPage() {
                 v{health.version}
               </Typography.Text>
             </Descriptions.Item>
-            <Descriptions.Item label="数据库">
-              {health.database?.tables ?? '—'} 张表 ·
-              WAL={String(health.database?.journal_mode ?? '—')}
-            </Descriptions.Item>
-            <Descriptions.Item label="沙箱网络隔离">
-              {health.sandbox?.network_isolated
-                ? <Tag color="green">已隔离</Tag>
-                : <Tag color="red">未隔离</Tag>}
-            </Descriptions.Item>
+            {healthDetail ? (
+              <>
+                <Descriptions.Item label="数据库">
+                  {healthDetail.database?.tables ?? '—'} 张表 ·
+                  WAL={String(healthDetail.database?.journal_mode ?? '—')}
+                </Descriptions.Item>
+                <Descriptions.Item label="沙箱网络隔离">
+                  {healthDetail.sandbox?.network_isolated
+                    ? <Tag color="green">已隔离</Tag>
+                    : <Tag color="red">未隔离</Tag>}
+                </Descriptions.Item>
+              </>
+            ) : (
+              <Descriptions.Item label="运维详情">
+                <Typography.Text type="secondary">
+                  仅平台管理员可见
+                </Typography.Text>
+              </Descriptions.Item>
+            )}
           </Descriptions>
         ) : (
           <Typography.Text type="secondary">加载中…</Typography.Text>

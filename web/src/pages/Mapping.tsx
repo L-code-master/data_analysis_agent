@@ -27,15 +27,21 @@ export default function MappingPage() {
   const [saving, setSaving] = useState(false)
 
   useEffect(() => {
+    // ★ ignore 旧请求：快速切换数据源时，慢响应不能覆盖新画像（P1-20）
+    let cancelled = false
+    setLoading(true)
+    setProfile(null)
     sourceApi.profile(sourceId)
       .then((p) => {
+        if (cancelled) return
         setProfile(p)
         const m: Record<string, string> = {}
         p.mappings.forEach((x) => { m[x.target_field] = x.source_column })
         setMapping(m)
       })
-      .catch((e) => message.error(errMsg(e)))
-      .finally(() => setLoading(false))
+      .catch((e) => { if (!cancelled) message.error(errMsg(e)) })
+      .finally(() => { if (!cancelled) setLoading(false) })
+    return () => { cancelled = true }
   }, [sourceId])
 
   const save = async () => {

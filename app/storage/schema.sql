@@ -38,6 +38,7 @@ CREATE TABLE IF NOT EXISTS users (
     failed_attempts   INTEGER NOT NULL DEFAULT 0,
     locked_until      TEXT,
     last_login_at     TEXT,
+    token_valid_after TEXT,                             -- 登出/改密水位：早于此签发的 access 失效
     created_at        TEXT NOT NULL,
     updated_at        TEXT NOT NULL
 );
@@ -51,6 +52,7 @@ CREATE TABLE IF NOT EXISTS refresh_tokens (
     id                TEXT PRIMARY KEY,
     user_id           TEXT NOT NULL REFERENCES users(id),
     token_hash        TEXT NOT NULL,                    -- 存哈希不存原文
+    family_id         TEXT,                             -- 轮换族：重放检测时整族吊销
     expires_at        TEXT NOT NULL,
     revoked_at        TEXT,
     user_agent        TEXT,
@@ -78,7 +80,10 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_ott_hash ON one_time_tokens(token_hash);
 -- 5. 额度账户（按次付费模型的核心）
 -- ---------------------------------------------------------------------------
 -- 设计：不用"订阅"概念，改为"次数额度"（credit）。
---   购买 → 加额度；消费 → 扣额度；额度有有效期。
+--   购买 → 加额度；消费 → 扣额度。
+--   ★ 额度按**批次**管理（credit_lots）：每批有各自有效期，
+--     消费按「最早到期优先」（FIFO）扣减，到期批次自动作废并记 expire 流水。
+--     5 次包有效期 pack5_valid_days（默认 180 天），其余 credit_expire_days（365）。
 --   比订阅简单得多：无周期续费、无按比例退款、无状态机。
 CREATE TABLE IF NOT EXISTS credit_accounts (
     id                TEXT PRIMARY KEY,
@@ -108,10 +113,64 @@ CREATE TABLE IF NOT EXISTS credit_ledger (
     balance_after     INTEGER NOT NULL,              -- 变动后余额（对账用）
     reason            TEXT NOT NULL,                 -- purchase | consume | refund | grant | expire
     expires_at        TEXT,                          -- 该批额度的到期时间
+    lot_id            TEXT,                          -- → credit_lots.id（消费/退款溯源）
     note              TEXT,
     created_at        TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_ledger_tenant ON credit_ledger(tenant_id, created_at DESC);
+
+-- ★ 退款幂等（docs/16 P1-2）：同一诊断的 consume / refund 各自最多一条。
+--   旧实现 refund_credit 可被重复调用（重放/重试）→ 余额凭空增加。
+--   应用层在事务内先查后写；本索引是数据库层的最后一道防线。
+CREATE UNIQUE INDEX IF NOT EXISTS idx_ledger_diag_once
+    ON credit_ledger(tenant_id, diagnosis_id, reason)
+    WHERE diagnosis_id IS NOT NULL AND reason IN ('consume', 'refund');
+
+-- ---------------------------------------------------------------------------
+-- 6.1 额度批次（FIFO 过期，docs/16 P1-6）
+-- ---------------------------------------------------------------------------
+-- 每次购买/赠送/退款产生一个批次；消费从「最早到期」的批次扣 1；
+-- 到期批次由 billing._expire_due_lots 归零并写 expire 流水。
+-- expires_at 为 NULL 表示永久有效（配置天数 <= 0 时）。
+CREATE TABLE IF NOT EXISTS credit_lots (
+    id                TEXT PRIMARY KEY,
+    tenant_id         TEXT NOT NULL REFERENCES tenants(id),
+    source            TEXT NOT NULL,                 -- purchase | grant | refund | legacy | adjustment
+    source_ref        TEXT,                          -- order_id / diagnosis_id
+    granted           INTEGER NOT NULL,              -- 初始次数
+    remaining         INTEGER NOT NULL,              -- 剩余次数
+    expires_at        TEXT,                          -- NULL = 永久有效
+    note              TEXT,
+    created_at        TEXT NOT NULL,
+    updated_at        TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_lots_fifo
+    ON credit_lots(tenant_id, expires_at, created_at);
+CREATE INDEX IF NOT EXISTS idx_lots_live
+    ON credit_lots(tenant_id, remaining);
+
+-- ---------------------------------------------------------------------------
+-- 6.5 待补偿退款（docs/16 P1-3）
+-- ---------------------------------------------------------------------------
+-- 诊断失败应退还额度。若退款写入失败（数据库锁/磁盘错误），
+-- 绝不能静默吞掉 —— 落本表，启动时与每次对账重试；超过重试上限转人工。
+CREATE TABLE IF NOT EXISTS refund_pending (
+    id                TEXT PRIMARY KEY,
+    tenant_id         TEXT NOT NULL REFERENCES tenants(id),
+    diagnosis_id      TEXT NOT NULL,
+    reason            TEXT NOT NULL DEFAULT '',
+    attempts          INTEGER NOT NULL DEFAULT 0,
+    last_error        TEXT,
+    status            TEXT NOT NULL DEFAULT 'pending',  -- pending | resolved | manual_review
+    note              TEXT,
+    created_at        TEXT NOT NULL,
+    updated_at        TEXT NOT NULL,
+    resolved_at       TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_refund_pending_status
+    ON refund_pending(status, created_at);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_refund_pending_diag
+    ON refund_pending(tenant_id, diagnosis_id) WHERE status = 'pending';
 
 -- ---------------------------------------------------------------------------
 -- 7. 订单（支付流水）

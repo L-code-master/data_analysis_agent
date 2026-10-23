@@ -24,7 +24,8 @@ class LoginRequest(BaseModel):
 
 
 class RefreshRequest(BaseModel):
-    refresh_token: str = Field(min_length=8)
+    # ★ 可选：新版前端依赖 httpOnly cookie，body 仅兼容旧客户端（P2-16）
+    refresh_token: str | None = Field(default=None, min_length=8)
 
 
 class ChangePasswordRequest(BaseModel):
@@ -45,11 +46,23 @@ class UserResponse(BaseModel):
     email: str
     role: str
     display_name: str = ''
+    email_verified: bool = False
 
 
 class AuthResponse(BaseModel):
     user: UserResponse
     token: TokenResponse
+    verification_required: bool = False
+    verification_sent: bool = False
+
+
+class VerifyEmailRequest(BaseModel):
+    token: str = Field(min_length=20, max_length=256)
+
+
+class VerifyEmailResponse(BaseModel):
+    message: str
+    user: UserResponse
 
 
 # ---------------------------------------------------------------------------
@@ -148,6 +161,10 @@ class ChatMessageResponse(BaseModel):
     created_at: str = ''
 
 
+class AskRequest(BaseModel):
+    question: str = Field(min_length=1, max_length=2000)
+
+
 class ChatAnswerResponse(BaseModel):
     answer: str
     route: str = Field(description='qa（形态A 查数）| agent（形态B LLM循环）| ...')
@@ -196,6 +213,7 @@ class AccountResponse(BaseModel):
     total_used: int
     trial_available: bool
     cost_used_usd: float
+    next_expiry_at: str = ''
     prices: dict[str, int] = {}
 
 
@@ -232,6 +250,7 @@ class LedgerEntry(BaseModel):
     reason: str
     note: str = ''
     created_at: str
+    expires_at: str = ''
 
 
 # ---------------------------------------------------------------------------

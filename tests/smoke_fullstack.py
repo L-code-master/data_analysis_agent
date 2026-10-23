@@ -61,12 +61,29 @@ TOKEN = r['token']['access_token']
 print(f'  租户 {r["user"]["tenant_id"][:12]}…')
 
 # ---------- 3. 购买 ----------
-print('\n[3] 购买 5 次包')
+print('\n[3] 购买 5 次包（人工核销需平台管理员）')
 st, o = req('POST', '/billing/orders', TOKEN, json_body={'sku': 'pack5'})
 check('创建订单', st == 201, f'HTTP {st}')
 print(f'  订单 {o["order_no"]}  ¥{o["amount_yuan"]:.0f}  {o["quantity"]}次')
-st, acc = req('POST', f'/billing/orders/{o["order_no"]}/confirm', TOKEN)
-check('确认收款', st == 200, f'HTTP {st}')
+
+# ★ P0-1：owner 自助核销必须被拒
+st, _ = req('POST', f'/billing/orders/{o["order_no"]}/confirm', TOKEN)
+check('★ owner 自助核销被拒 403', st == 403, f'HTTP {st}')
+
+# 平台管理员核销（SUPER_ADMIN_EMAILS 白名单邮箱，见 .env；
+# 用冒烟专用管理员：首次注册，后续冒烟用同一密码登录）
+ADMIN_EMAIL, ADMIN_PASS = 'smoke-admin@shop.com', 'SmokeAdmin!2026'
+st, r = req('POST', '/auth/register', json_body={
+    'email': ADMIN_EMAIL, 'password': ADMIN_PASS, 'tenant_name': '平台管理'})
+if st == 409:                                     # 之前冒烟已注册 → 登录
+    st, r = req('POST', '/auth/login', json_body={
+        'email': ADMIN_EMAIL, 'password': ADMIN_PASS})
+check('管理员就绪（注册或登录）', st in (200, 201) and
+      r.get('user', {}).get('role') == 'admin', f'HTTP {st} role={r.get("user", {}).get("role") if isinstance(r, dict) else "?"}')
+ADMIN_TOKEN = r['token']['access_token']
+
+st, acc = req('POST', f'/billing/orders/{o["order_no"]}/confirm', ADMIN_TOKEN)
+check('管理员确认收款', st == 200, f'HTTP {st}')
 print(f'  余额 {acc["balance"]}（注册赠送 1 + 购买 5）')
 check('额度到账（1+5=6）', acc['balance'] == 6, acc['balance'])
 

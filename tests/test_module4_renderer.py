@@ -40,7 +40,13 @@ INSERT INTO stg_sycm_traffic
   source_channel,cart_buyers,favorite_buyers) VALUES
  ('2026-10-01','SHOP','','',1000,2500,20,30,6000,25,32,6400,NULL,65,'TOTAL',120,60),
  ('2026-10-02','SHOP','','', 950,2300,16,24,4800,19,26,5100,NULL,62,'TOTAL',105,55),
- ('2026-10-03','SHOP','','', 800,2000,12,18,3600,15,20,3900,NULL,60,'TOTAL', 90,45);
+ ('2026-10-03','SHOP','','', 800,2000,12,18,3600,15,20,3900,NULL,60,'TOTAL', 90,45),
+ -- ★ P1-9 反例数据：同一店铺的「分渠道行」与「商品级行」。
+ --   旧实现 SUM 会把它们与 TOTAL 一起相加（1000+600+400+500=2500），
+ --   指标必须由 base_filter 只取 SHOP + TOTAL。
+ ('2026-10-01','SHOP','','', 600,1500,12,18,3600,15,20,3900,NULL,65,'手淘搜索',70,35),
+ ('2026-10-01','SHOP','','', 400,1000, 8,12,2400,10,12,2500,NULL,65,'直通车',50,25),
+ ('2026-10-01','ITEM','ITEM-A','连衣裙',500,1200,10,15,3000,12,16,3200,NULL,60,'TOTAL',60,30);
 
 INSERT INTO stg_trade_orders
  (order_id,sub_order_id,create_time,pay_time,ship_time,confirm_time,order_status,
@@ -168,6 +174,10 @@ q, rows = run('M01', metric_id='M01', time_range=None)
 print(f'  SQL: {q.sql}')
 print(f'  结果: {rows}')
 check('M01 合计 = 2750', rows[0][0] == 2750, rows[0][0])
+check('★ P1-9 排除分渠道/商品级行（旧实现会得 4250）',
+      rows[0][0] == 2750, rows[0][0])
+check('★ base_filter 参数化（SHOP + TOTAL）',
+      'SHOP' in q.params and 'TOTAL' in q.params, q.params)
 
 # --- 按日期分组 ---
 print('\n  ── M01 按日期 ──')
@@ -221,6 +231,15 @@ print(f'  参数: {q.params}')
 print(f'  值: {rows[0][0]:.6f}')
 expected = 400.0 / 14400.0
 check(f'M17 = 400/14400 = {expected:.6f}', abs(rows[0][0] - expected) < 1e-9, rows[0][0])
+
+# ★ P0-5：M17 带维度必须拒绝 —— 旧实现渲染成
+#   SELECT item_id, <全局退款率> ... GROUP BY item_id，每组拿到同一个全店值
+for dim in ('item_id', 'date', 'reason_category'):
+    try:
+        r.render(metric_id='M17', dimensions=(dim,), time_range=None)
+        check(f'M17 拒绝维度 {dim}（跨视图口径不切片）', False, '未拒绝！')
+    except RenderError as e:
+        check(f'M17 拒绝维度 {dim}（跨视图口径不切片）', True, str(e)[:50])
 
 # ===========================================================================
 # 4. 安全：维度越权必须拒绝

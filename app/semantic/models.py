@@ -91,6 +91,10 @@ class MetricDefinition:
     business_def: str = ''
     formula_view: str = ''
     formula_expression: str = ''
+    # ★ 机器可执行规格随加载一起缓存（docs/16 P1-16）：
+    #   否则渲染器每次都要回查 sem_metric_registry；连接关闭后也无法复用
+    #   已加载的 registry（chat 的 Agent 工具调用场景）。
+    metric_spec_raw: str = ''
 
     time_grain: tuple[str, ...] = ('day', 'week', 'month')
     caliber_rules: dict[str, Any] = field(default_factory=dict)
@@ -183,6 +187,7 @@ class MetricDefinition:
             business_def=str(_get('business_def', '') or ''),
             formula_view=str(_get('formula_view', '') or ''),
             formula_expression=str(_get('formula_expression', '') or ''),
+            metric_spec_raw=str(_get('metric_spec', '') or ''),
             time_grain=_json_tuple(_get('time_grain')) or ('day', 'week', 'month'),
             caliber_rules=_json_dict(_get('caliber_rules')),
             footnote_template=str(_get('footnote_template', '') or ''),

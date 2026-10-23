@@ -10,14 +10,15 @@ import {
   type ReactNode,
 } from 'react'
 import { authApi, tokenStore } from '../api/client'
-import type { UserInfo } from '../api/types'
+import type { AuthResponse, UserInfo } from '../api/types'
 
 interface AuthContextValue {
   user: UserInfo | null
   loading: boolean
   initialized: boolean
   login: (email: string, password: string) => Promise<void>
-  register: (email: string, password: string, tenantName: string) => Promise<void>
+  register: (email: string, password: string,
+             tenantName: string) => Promise<AuthResponse>
   logout: () => Promise<void>
   refresh: () => Promise<void>
 }
@@ -36,11 +37,25 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       return
     }
     setLoading(true)
+    // ★ 401 才清 token；网络瞬断保留 token 并重试一次（docs/16 P1-19）
+    const load = async (retry: boolean): Promise<void> => {
+      try {
+        setUser(await authApi.me())
+      } catch (e) {
+        const status = (e as { response?: { status?: number } })?.response?.status
+        if (status === 401) {
+          tokenStore.clear()
+          setUser(null)
+        } else if (retry) {
+          await new Promise((r) => setTimeout(r, 1200))
+          return load(false)
+        } else {
+          setUser(null)          // 保留 token，网络恢复后刷新即可
+        }
+      }
+    }
     try {
-      setUser(await authApi.me())
-    } catch {
-      tokenStore.clear()
-      setUser(null)
+      await load(true)
     } finally {
       setLoading(false)
       setInitialized(true)
@@ -70,14 +85,21 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       const res = await authApi.register(email, password, tenantName)
       setUser(res.user)
       setInitialized(true)
+      return res
     } finally {
       setLoading(false)
     }
   }, [])
 
   const logout = useCallback(async () => {
-    await authApi.logout()
-    setUser(null)
+    // ★ 本地登出必须成功：接口失败（网络/401）不能把用户卡在登录态
+    try {
+      await authApi.logout()
+    } catch {
+      /* tokenStore 已在 authApi.logout 的 finally 中清空 */
+    } finally {
+      setUser(null)
+    }
   }, [])
 
   const value = useMemo<AuthContextValue>(

@@ -17,7 +17,9 @@
 from __future__ import annotations
 
 import datetime as dt
+import html
 import json
+import logging
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -26,12 +28,14 @@ from typing import Any, Callable
 from app.adapters import taobao
 from app.adapters.taobao_fields import get_spec
 from app.config import get_settings
-from app.services import billing, tenant as tn
+from app.services import billing, locks, tenant as tn
 from app.semantic.models import CaliberConflict
 from app.semantic.registry import SemanticRegistry
 from app.semantic.renderer import SQLRenderer, RenderError
 from app.semantic.timerange import DateRange, parse_range
 from app.storage import db
+
+logger = logging.getLogger(__name__)
 
 
 class DiagnosisError(Exception):
@@ -321,8 +325,9 @@ def profile_source(tenant_id: str, source_id: str) -> ProfileResult:
         columns=[str(c) for c in prepared.read.headers],
         mappings=mappings,
         missing_required=prepared.missing_required,
-        needs_confirmation=bool(prepared.missing_required or
-                                any(m['needs_review'] for m in mappings)),
+        needs_confirmation=bool(prepared.missing_required
+                                or prepared.read.truncated
+                                or any(m['needs_review'] for m in mappings)),
         schema_fingerprint=prepared.schema_fingerprint,
         warnings=list(prepared.read.warnings) + list(spec.notes),
     )
@@ -400,66 +405,222 @@ def confirm_mapping(tenant_id: str, user_id: str, source_id: str,
 # ===========================================================================
 
 def _open_semantic_db(tenant_id: str):
-    """打开（并在首次时初始化）该租户的 DuckDB 语义层库。"""
+    """打开该租户的 DuckDB 语义层库；首次建库并推进版本迁移。"""
     import duckdb
 
     p = tn.ensure_tenant_dirs(tenant_id)
     con = duckdb.connect(str(p.semantic_db))
 
-    # 首次：应用 schema
+    # 首次：应用 schema（schema.sql 会写入当前 SEMANTIC_SCHEMA_VERSION）
     has_table = con.execute(
         "SELECT COUNT(*) FROM information_schema.tables "
         "WHERE table_name = 'sem_metric_registry'").fetchone()[0]
     if not has_table:
         schema_file = get_settings().semantic_schema_file
         con.execute(schema_file.read_text(encoding='utf-8'))
+
+    # ★ 存量库按版本迁移（docs/16 P1-12）：视图/注册表只在建库时应用，
+    #   schema 修订到不了旧库。只落后时执行，失败必须抛出 —— 不能再
+    #   `except Exception: pass` 让视图停留在旧口径却照常出报告。
+    _migrate_semantic_db(con)
     return con
 
 
 # ---------------------------------------------------------------------------
-# 语义层升级（存量租户补丁，幂等）
+# 语义层版本化迁移（docs/16 P1-12）
 # ---------------------------------------------------------------------------
-# 背景：视图段（S6）与维表种子只在**建库时**应用；schema 后续修订时，
-# 存量租户的 DuckDB 不会自动更新。每条修订在这里以幂等方式重放：
-#   U1  dim_refund_reason 种子 + v_refund_daily 最长前缀匹配（v1.2 归因）
-_SEMANTIC_UPGRADES = [
-    # U1a：退款原因种子（幂等）
-    """INSERT INTO dim_refund_reason
-       SELECT s.reason_text, s.reason_category FROM (
-         VALUES ('质量问题','QUALITY'),('假冒','QUALITY'),
-                ('尺寸不符','SIZE'),('尺码','SIZE'),('大小不符','SIZE'),
-                ('物流','LOGISTICS'),('未收到货','LOGISTICS'),
-                ('描述不符','DESCRIPTION'),('与描述不符','DESCRIPTION'),
-                ('图片不符','DESCRIPTION')
-       ) AS s(reason_text, reason_category)
-       WHERE NOT EXISTS (
-         SELECT 1 FROM dim_refund_reason r WHERE r.reason_text = s.reason_text)""",
-    # U1b：退款原因匹配改为最长前缀（'质量问题-起球' → QUALITY）
-    """CREATE OR REPLACE VIEW v_refund_daily AS
-       SELECT apply_date AS stat_date, item_id, merchant_code,
-              COALESCE((SELECT r.reason_category FROM dim_refund_reason r
-                        WHERE f.refund_reason LIKE r.reason_text || '%'
-                        ORDER BY LENGTH(r.reason_text) DESC LIMIT 1),
-                       'OTHER') AS reason_category,
-              COUNT(*) AS refund_count, SUM(quantity) AS refund_qty,
-              SUM(refund_amount) AS refund_amount
-       FROM dwd_refund_line f
-       WHERE refund_status = '退款成功'
-       GROUP BY 1, 2, 3, 4""",
+# 版本号与 semantic/schema.sql 的 sem_schema_version 种子保持一致。
+# 新增修订时：① 把改动写进 schema.sql（新库直接是最新口径）；
+# ② 在 _SEMANTIC_MIGRATIONS 追加一条（旧库按版本补丁）；
+# ③ 提升 SEMANTIC_SCHEMA_VERSION 与 schema.sql 的种子版本。
+SEMANTIC_SCHEMA_VERSION = 4
+
+# 流量指标统一口径（与 schema.sql S5.1 的归一化、S7 的 metric_spec 对齐）
+_TRAFFIC_BASE_FILTER = {'stat_scope': 'SHOP', 'source_channel': 'TOTAL'}
+_TRAFFIC_METRIC_SPECS: dict[str, dict] = {
+    'M01': {'agg': 'SUM', 'expr': 'visitors', 'unit': 'count',
+            'base_filter': _TRAFFIC_BASE_FILTER},
+    'M02': {'agg': 'SUM', 'expr': 'page_views', 'unit': 'count',
+            'base_filter': _TRAFFIC_BASE_FILTER},
+    'M03': {'agg': 'RATIO', 'num_expr': 'pay_buyers', 'num_agg': 'SUM',
+            'den_expr': 'visitors', 'den_agg': 'SUM', 'unit': 'percent',
+            'base_filter': _TRAFFIC_BASE_FILTER},
+    'M04': {'agg': 'RATIO', 'num_expr': 'order_buyers', 'num_agg': 'SUM',
+            'den_expr': 'visitors', 'den_agg': 'SUM', 'unit': 'percent',
+            'base_filter': _TRAFFIC_BASE_FILTER},
+    'M05': {'agg': 'RATIO', 'num_expr': 'pay_amount', 'num_agg': 'SUM',
+            'den_expr': 'pay_buyers', 'den_agg': 'SUM', 'unit': 'currency',
+            'base_filter': _TRAFFIC_BASE_FILTER},
+}
+
+# 利润链视图（与 schema.sql 的 v_profit_daily 保持一致）：
+#   P0-4 广告费按净销售占比分摊；P1-8 缺批次时 COGS 保留 NULL。
+_PROFIT_DAILY_VIEW_SQL = """CREATE OR REPLACE VIEW v_profit_daily AS
+   WITH sales AS (
+       SELECT stat_date, item_id, merchant_code,
+              SUM(pay_amount) AS pay_amount,
+              SUM(quantity)   AS quantity,
+              SUM(net_sales)  AS net_sales
+       FROM v_sales_daily GROUP BY 1, 2, 3
+   ), sales_total AS (
+       SELECT stat_date, SUM(net_sales) AS day_net_sales
+       FROM v_sales_daily GROUP BY 1
+   ), wac AS (
+       SELECT merchant_code,
+              SUM(total_unit_cost * quantity) / NULLIF(SUM(quantity), 0) AS wac
+       FROM dwd_cost_batch GROUP BY merchant_code
+   ), fees AS (
+       SELECT posted_date AS d,
+              SUM(CASE WHEN fee_category = 'COMMISSION' THEN amount ELSE 0 END) AS commission,
+              SUM(CASE WHEN fee_category = 'TECH_SERVICE' THEN amount ELSE 0 END) AS tech_service,
+              SUM(CASE WHEN fee_category = 'SHIPPING_SUBSIDY' THEN amount ELSE 0 END) AS shipping_fee_plat,
+              SUM(CASE WHEN fee_category = 'OTHER' THEN amount ELSE 0 END) AS other_fee
+       FROM dwd_platform_fee GROUP BY 1
+   ), ads AS (
+       SELECT stat_date AS d, SUM(spend) AS ad_spend
+       FROM dwd_ad_daily GROUP BY 1
+   )
+   SELECT s.stat_date, s.item_id, s.merchant_code,
+          s.net_sales,
+          -- 缺批次保留 NULL（P1-8），绝不按 0 兜底
+          s.quantity * w.wac AS cogs,
+          COALESCE(f.commission, 0)
+            * s.net_sales / NULLIF(st.day_net_sales, 0)  AS commission,
+          COALESCE(f.tech_service, 0)
+            * s.net_sales / NULLIF(st.day_net_sales, 0)  AS tech_service,
+          COALESCE(f.shipping_fee_plat, 0)
+            * s.net_sales / NULLIF(st.day_net_sales, 0)  AS shipping_fee_plat,
+          COALESCE(f.other_fee, 0)
+            * s.net_sales / NULLIF(st.day_net_sales, 0)  AS other_fee,
+          COALESCE(COALESCE(a.ad_spend, 0)
+                     * s.net_sales / NULLIF(st.day_net_sales, 0), 0) AS ad_spend,
+          s.net_sales - s.quantity * w.wac
+            - COALESCE(f.commission, 0) * s.net_sales / NULLIF(st.day_net_sales, 0)
+            - COALESCE(f.tech_service, 0) * s.net_sales / NULLIF(st.day_net_sales, 0)
+            AS gross_margin,
+          CASE WHEN s.net_sales > 0 THEN
+            (s.net_sales - s.quantity * w.wac
+             - COALESCE(f.commission, 0) * s.net_sales / NULLIF(st.day_net_sales, 0)
+             - COALESCE(f.tech_service, 0) * s.net_sales / NULLIF(st.day_net_sales, 0)
+            ) / s.net_sales END AS gross_margin_rate,
+          s.net_sales - s.quantity * w.wac
+            - COALESCE(f.commission, 0) * s.net_sales / NULLIF(st.day_net_sales, 0)
+            - COALESCE(f.tech_service, 0) * s.net_sales / NULLIF(st.day_net_sales, 0)
+            - COALESCE(COALESCE(a.ad_spend, 0)
+                         * s.net_sales / NULLIF(st.day_net_sales, 0), 0)
+            AS margin_after_ads
+   FROM sales s
+   LEFT JOIN sales_total st ON st.stat_date = s.stat_date
+   LEFT JOIN wac w          ON w.merchant_code = s.merchant_code
+   LEFT JOIN fees f         ON f.d = s.stat_date
+   LEFT JOIN ads a          ON a.d = s.stat_date"""
+
+
+def _mig_v1(con) -> None:
+    """v1：退款原因种子 + 最长前缀匹配（v1.2 归因）。"""
+    con.execute(
+        """INSERT INTO dim_refund_reason
+           SELECT s.reason_text, s.reason_category FROM (
+             VALUES ('质量问题','QUALITY'),('假冒','QUALITY'),
+                    ('尺寸不符','SIZE'),('尺码','SIZE'),('大小不符','SIZE'),
+                    ('物流','LOGISTICS'),('未收到货','LOGISTICS'),
+                    ('描述不符','DESCRIPTION'),('与描述不符','DESCRIPTION'),
+                    ('图片不符','DESCRIPTION')
+           ) AS s(reason_text, reason_category)
+           WHERE NOT EXISTS (
+             SELECT 1 FROM dim_refund_reason r
+             WHERE r.reason_text = s.reason_text)""")
+    con.execute(
+        """CREATE OR REPLACE VIEW v_refund_daily AS
+           SELECT apply_date AS stat_date, item_id, merchant_code,
+                  COALESCE((SELECT r.reason_category FROM dim_refund_reason r
+                            WHERE f.refund_reason LIKE r.reason_text || '%'
+                            ORDER BY LENGTH(r.reason_text) DESC LIMIT 1),
+                           'OTHER') AS reason_category,
+                  COUNT(*) AS refund_count, SUM(quantity) AS refund_qty,
+                  SUM(refund_amount) AS refund_amount
+           FROM dwd_refund_line f
+           WHERE refund_status = '退款成功'
+           GROUP BY 1, 2, 3, 4""")
+
+
+def _mig_v2(con) -> None:
+    """v2：广告费按当日净销售占比分摊（P0-4）。"""
+    con.execute(_PROFIT_DAILY_VIEW_SQL)
+
+
+def _mig_v3(con) -> None:
+    """v3：移除 M17 维度白名单（P0-5，CROSS_VIEW 不能切片）。"""
+    con.execute("DELETE FROM sem_metric_dimension WHERE metric_id = 'M17'")
+
+
+def _mig_v4(con) -> None:
+    """v4：COGS 缺批次保留 NULL（P1-8）+ 流量口径 base_filter（P1-9）。"""
+    con.execute(_PROFIT_DAILY_VIEW_SQL)
+    for mid, spec in _TRAFFIC_METRIC_SPECS.items():
+        con.execute(
+            'UPDATE sem_metric_registry SET metric_spec = ? '
+            'WHERE metric_id = ?',
+            [json.dumps(spec, ensure_ascii=False), mid])
+    con.execute(
+        "DELETE FROM sem_metric_dimension "
+        "WHERE metric_id = 'M01' AND dimension_name = 'source_channel'")
+
+
+_SEMANTIC_MIGRATIONS: list[tuple[int, str, Callable[[Any], None]]] = [
+    (1, '退款原因最长前缀匹配', _mig_v1),
+    (2, '广告费按净销售占比分摊（P0-4）', _mig_v2),
+    (3, '移除 M17 维度白名单（P0-5）', _mig_v3),
+    (4, 'COGS 缺批次保留 NULL + 流量口径 base_filter（P1-8/P1-9）', _mig_v4),
 ]
 
 
-def _apply_semantic_upgrades(con) -> None:
-    """对存量租户库重放语义层修订（幂等，失败不阻断诊断）。"""
-    for sql in _SEMANTIC_UPGRADES:
+def _migrate_semantic_db(con) -> int:
+    """把存量租户库推进到 SEMANTIC_SCHEMA_VERSION，返回当前版本。
+
+    ★ 失败必须抛出（docs/16 P1-12）：视图停在旧口径却照常出报告，
+      比诊断失败更伤人 —— 用户看到的数字是错的却无从得知。
+    """
+    con.execute(
+        """CREATE TABLE IF NOT EXISTS sem_schema_version (
+               version      INTEGER PRIMARY KEY,
+               description  TEXT,
+               applied_at   TIMESTAMP DEFAULT CURRENT_TIMESTAMP)""")
+    row = con.execute(
+        'SELECT COALESCE(MAX(version), 0) FROM sem_schema_version').fetchone()
+    current = int(row[0] or 0) if row else 0
+    if current >= SEMANTIC_SCHEMA_VERSION:
+        return current
+
+    for version, desc, fn in _SEMANTIC_MIGRATIONS:
+        if version <= current:
+            continue
         try:
-            con.execute(sql)
-        except Exception:                   # noqa: BLE001
-            pass
+            fn(con)
+            con.execute(
+                'INSERT INTO sem_schema_version (version, description) '
+                'VALUES (?, ?)', [version, desc])
+        except Exception as e:              # noqa: BLE001
+            raise DiagnosisError(
+                f'语义层迁移 v{version}（{desc}）失败: {e}',
+                'SEMANTIC_MIGRATION_FAILED') from e
+        current = version
+        logger.info('语义层迁移完成：v%d %s', version, desc)
+    return current
 
 
-def _import_stg(con, prepared, mapping: dict[str, str], table: str) -> int:
-    """把源文件数据导入标准 STG 表。"""
+def _apply_semantic_upgrades(con) -> int:
+    """兼容旧调用名的别名：语义层升级 = 按版本迁移。"""
+    return _migrate_semantic_db(con)
+
+
+def _import_stg(con, prepared, mapping: dict[str, str],
+                table: str) -> tuple[int, dict[str, dict]]:
+    """把源文件数据导入标准 STG 表。
+
+    返回 (导入行数, 数值清洗失败汇总)。失败值已置 NULL —— 但也必须
+    记录到 dwd_etl_errors(BAD_AMOUNT)，不能静默（docs/16 P1-10）。
+    """
     spec = get_spec(prepared.spec.key)
     read = prepared.read
 
@@ -472,7 +633,7 @@ def _import_stg(con, prepared, mapping: dict[str, str], table: str) -> int:
             col_of[target] = idx
 
     if not col_of:
-        return 0
+        return 0, {}
 
     con.execute(f'DELETE FROM {table}')
 
@@ -482,19 +643,62 @@ def _import_stg(con, prepared, mapping: dict[str, str], table: str) -> int:
     sql = f'INSERT INTO {table} ({cols}) VALUES ({placeholders})'
 
     rows = []
+    bad_values: dict[str, dict] = {}
     for raw in read.rows:
         vals = []
         for t in targets:
             v = raw[col_of[t]] if col_of[t] < len(raw) else None
             # 类型驱动转换（按目标表的列类型，不靠字段名猜）
-            vals.append(taobao.coerce_for_table(table, t, v))
+            vals.append(taobao.coerce_for_table(table, t, v, bad_values))
         if all(x is None for x in vals):
             continue
         rows.append(vals)
 
     if rows:
         con.executemany(sql, rows)
-    return len(rows)
+    return len(rows), bad_values
+
+
+def _record_bad_amounts(con, bad_amounts: dict[str, dict]) -> None:
+    """把导入期数值清洗失败写入 dwd_etl_errors（docs/16 P1-10）。
+
+    必须在 S5 ETL 之后调用：S5 开头会清空本次 run 的错误表。
+    QC-10(WARN) 再把它汇总进质量结果。
+    """
+    n = 0
+    for table, fields in bad_amounts.items():
+        for field, info in fields.items():
+            n += 1
+            samples = '、'.join(info.get('samples') or []) or '—'
+            con.execute(
+                'INSERT INTO dwd_etl_errors VALUES (?,?,?,?,?,?,?,?,?)',
+                (f'E-BAD-{n}', 'v1-full-refresh', 'import', 'WARN',
+                 'BAD_AMOUNT',
+                 f'数值清洗失败已置 NULL: {table}.{field} × '
+                 f'{info.get("count", 0)} 行（示例: {samples}）',
+                 table, field, dt.datetime.now()))
+
+
+def _etl_warning_messages(con) -> list[str]:
+    """把本次 ETL/导入的 WARN 转成报告「计算提示」。"""
+    try:
+        rows = con.execute(
+            "SELECT error_code, message FROM dwd_etl_errors "
+            "WHERE run_id = 'v1-full-refresh' AND severity = 'WARN' "
+            "ORDER BY error_code").fetchall()
+    except Exception:                       # noqa: BLE001
+        return []
+    out: list[str] = []
+    seen: set[str] = set()
+    for code, msg in rows:
+        text = f'[{code}] {msg}'
+        if text not in seen:                # 同一错误码多条时只保留示例级去重
+            seen.add(text)
+            out.append(text)
+        if len(out) >= 20:
+            out.append('（更多 ETL 提示已省略，详见 dwd_etl_errors）')
+            break
+    return out
 
 
 def run_diagnosis(tenant_id: str, user_id: str,
@@ -557,6 +761,21 @@ def run_diagnosis(tenant_id: str, user_id: str,
     srcs = [get_source(tenant_id, sid) for sid in ids]
     primary = srcs[0]
 
+    # ★ 同类型多数据源显式报错（docs/16 P0-6）：_import_stg 每次导入前
+    #   先整表 DELETE，同类型第二份文件会静默清掉第一份的数据 ——
+    #   报告只基于最后一份却把所有文件都算进 imported，数字与数据对不上。
+    _seen_tables: dict[str, str] = {}        # target_table -> 文件名
+    for x in srcs:
+        _spec = get_spec(x.source_type)
+        _name = x.original_name or x.filename
+        if _spec.target_table in _seen_tables:
+            raise DiagnosisError(
+                f'包含多个「{_spec.display_name}」类型的数据源'
+                f'（{_seen_tables[_spec.target_table]} 与 {_name}）。'
+                f'同类型文件只能导入一份 —— 请把它们合并成一个文件后重新上传',
+                'DUPLICATE_SOURCE_TYPE')
+        _seen_tables[_spec.target_table] = _name
+
     # ---- 1. 建诊断记录（先落库，便于前端轮询）----
     with db.transaction() as conn:
         conn.execute(
@@ -577,15 +796,21 @@ def run_diagnosis(tenant_id: str, user_id: str,
         raise
 
     con = None
+    # ★ P0-7：同租户互斥 —— 持锁期间独占 semantic.duckdb（导入/ETL/算指标
+    #   全程），防止与并发诊断或对话交错执行（详见 app/services/locks.py）。
+    #   锁在 finally 里随连接一起释放。
+    tenant_lk = locks.tenant_lock(tenant_id)
+    tenant_lk.acquire()
     try:
-        # ---- 3. 打开语义层库 ----
+        # ---- 3. 打开语义层库（内部已按版本迁移，不再每次重放 DDL）----
         emit('loading', '加载语义层')
         con = _open_semantic_db(tenant_id)
-        _apply_semantic_upgrades(con)
 
         # ---- 4. 逐个导入（★ 多文件）----
         p = tn.tenant_paths(tenant_id)
         imported: list[tuple[str, int]] = []
+        bad_amounts: dict[str, dict] = {}
+        import_warnings: list[str] = []
 
         for src in srcs:
             spec = get_spec(src.source_type)
@@ -607,7 +832,13 @@ def run_diagnosis(tenant_id: str, user_id: str,
                 if target not in mapping:
                     raise MappingNotConfirmedError()
 
-            n = _import_stg(con, prepared, mapping, spec.target_table)
+            n, bad = _import_stg(con, prepared, mapping, spec.target_table)
+            if bad:
+                bad_amounts[spec.target_table] = bad
+            if prepared.read.truncated:
+                import_warnings.append(
+                    f'{src.original_name or src.filename}: 超过 '
+                    f'{taobao.MAX_READ_ROWS:,} 行上限，报告基于截断后的数据')
             imported.append((spec.key, n))
             emit('importing', f'{spec.display_name}: {n} 行')
 
@@ -620,6 +851,10 @@ def run_diagnosis(tenant_id: str, user_id: str,
         i5 = schema_sql.index('-- ===== S5 ETL')
         i6 = schema_sql.index('-- ===== S6 指标视图')
         con.execute(schema_sql[i5:i6])
+
+        # ★ 导入期数值清洗失败落在 ETL 之后写入：S5 开头会清空本次 run
+        #   的错误表（docs/16 P1-10）。
+        _record_bad_amounts(con, bad_amounts)
 
         # ---- 6. 质量门 ----
         emit('quality', '数据质量校验')
@@ -645,7 +880,10 @@ def run_diagnosis(tenant_id: str, user_id: str,
 
         metrics: list[dict] = []
         footnotes: list[str] = []
-        warns: list[str] = []
+        warns: list[str] = list(import_warnings)
+        # ★ ETL/导入告警进报告（docs/16 P1-10）：缺成本批次、数值清洗失败、
+        #   账房未映射类型等不再只躺在 dwd_etl_errors 里。
+        warns.extend(_etl_warning_messages(con))
 
         for mid in targets:
             m = reg.get(mid)
@@ -727,13 +965,12 @@ def run_diagnosis(tenant_id: str, user_id: str,
             quality_passed=True, report_ref=aid, duration_ms=duration)
 
     except Exception as e:
-        # ★ 失败退还额度（用户不该为失败买单）；admin 未扣过，不退
+        # ★ 失败退还额度（用户不该为失败买单）；admin 未扣过，不退。
+        #   request_refund 内部幂等、失败落 refund_pending —— 绝不静默吞掉
+        #   （docs/16 P1-3）。
         if not is_admin:
-            try:
-                billing.refund_credit(tenant_id, did,
-                                       note=f'诊断失败退还: {type(e).__name__}')
-            except Exception:
-                pass
+            billing.request_refund(
+                tenant_id, did, note=f'诊断失败退还: {type(e).__name__}')
         _fail_diagnosis(did, str(e))
         if isinstance(e, DiagnosisError):
             raise
@@ -744,6 +981,7 @@ def run_diagnosis(tenant_id: str, user_id: str,
                 con.close()
             except Exception:
                 pass
+        tenant_lk.release()
 
 
 def _fail_diagnosis(did: str, error: str) -> None:
@@ -752,8 +990,39 @@ def _fail_diagnosis(did: str, error: str) -> None:
             conn.execute(
                 'UPDATE diagnoses SET status = ?, error = ?, finished_at = ? '
                 'WHERE id = ?', ('failed', error[:1000], _now(), did))
-    except Exception:
-        pass
+    except Exception:                                   # noqa: BLE001
+        logger.exception('诊断状态落库失败 diagnosis=%s', did)
+
+
+def reconcile_on_startup() -> dict:
+    """启动对账（docs/16 P1-3）。
+
+    进程重启会留下两类烂摊子：
+      1. status=queued/running 的诊断永远卡死（daemon 线程已随进程消失），
+         前端无限转圈，已扣额度也没有退款路径；
+      2. refund_pending 里等待重试的退款。
+
+    处理：遗留诊断标记 failed 并幂等补退款（request_refund 依赖
+    consume/refund 流水判定，重复执行不会重复加余额）；再重试补偿表。
+    """
+    with db.get_conn() as conn:
+        rows = conn.execute(
+            "SELECT id, tenant_id FROM diagnoses "
+            "WHERE status IN ('queued', 'running')").fetchall()
+
+    interrupted = 0
+    for row in rows:
+        did = _rg(row, 'id', 0)
+        tid = _rg(row, 'tenant_id', 1)
+        _fail_diagnosis(did, '服务重启，诊断中断（额度已自动退还）')
+        billing.request_refund(tid, did, note='服务重启对账退还')
+        interrupted += 1
+
+    refund_stats = billing.process_pending_refunds()
+    if interrupted or any(refund_stats.values()):
+        logger.info('启动对账：中断诊断 %d 个，补偿退款 %s',
+                    interrupted, refund_stats)
+    return {'interrupted': interrupted, **refund_stats}
 
 
 def _audit_admin_free(tenant_id: str, user_id: str, diagnosis_id: str) -> None:
@@ -895,8 +1164,10 @@ def _build_trend(con, tr) -> list[dict]:
             'SELECT stat_date, SUM(net_sales) FROM v_sales_daily '
             'GROUP BY 1 ORDER BY 1').fetchall()
         traffic = con.execute(
-            'SELECT stat_date, SUM(visitors), SUM(pay_buyers) '
-            'FROM v_traffic_daily GROUP BY 1 ORDER BY 1').fetchall()
+            "SELECT stat_date, SUM(visitors), SUM(pay_buyers) "
+            "FROM v_traffic_daily "
+            "WHERE stat_scope = 'SHOP' AND source_channel = 'TOTAL' "
+            "GROUP BY 1 ORDER BY 1").fetchall()
     except Exception:                       # noqa: BLE001
         return []
 
@@ -1094,10 +1365,14 @@ def _build_weekly_compare(con, tr) -> dict:
                        SUM(pay_amount), SUM(net_sales), SUM(refund_amount),
                        COUNT(DISTINCT stat_date)
                 FROM v_sales_daily {w} GROUP BY 1 ORDER BY 1''', p).fetchall()
+        traffic_where = (f"stat_scope = 'SHOP' AND source_channel = 'TOTAL'"
+                         + (' AND stat_date BETWEEN ? AND ?' if p else ''))
         traffic = con.execute(
             f'''SELECT DATE_TRUNC('week', stat_date)::DATE wk,
                        SUM(visitors), SUM(pay_buyers)
-                FROM v_traffic_daily {w} GROUP BY 1 ORDER BY 1''', p).fetchall()
+                FROM v_traffic_daily
+                WHERE {traffic_where}
+                GROUP BY 1 ORDER BY 1''', p).fetchall()
         ads = con.execute(
             f'''SELECT DATE_TRUNC('week', stat_date)::DATE wk, SUM(spend)
                 FROM dwd_ad_daily {w} GROUP BY 1 ORDER BY 1''', p).fetchall()
@@ -1199,6 +1474,11 @@ def _build_caliber_snapshot(con, metrics: list[dict], disclaimer: str) -> dict:
     }
 
 
+def _e(value: Any) -> str:
+    """HTML 转义（docs/16 P1-17）：报告可转发/打印，所有动态文本必须转义。"""
+    return html.escape(str(value if value is not None else ''))
+
+
 def _svg_trend(trend: list[dict], anomaly_dates: set[str] | None = None) -> str:
     """纯字符串生成趋势 SVG（双轴：净销售额柱/线 + 访客数线 + 异常日标记）。
 
@@ -1247,7 +1527,8 @@ def _svg_trend(trend: list[dict], anomaly_dates: set[str] | None = None) -> str:
         x = PL + i * (iw / (n - 1))
         labels.append(
             f'<text x="{x:.0f}" y="{H - 8}" text-anchor="middle" '
-            f'font-size="10" fill="#8c959f">{trend[i]["date"][5:]}</text>')
+            f'font-size="10" fill="#8c959f">'
+            f'{_e(trend[i]["date"][5:])}</text>')
 
     # y 轴刻度
     yl = []
@@ -1289,8 +1570,8 @@ def _metric_cards(metrics: list[dict]) -> str:
         cls = 'card warn' if warn else 'card'
         cards.append(
             f'<div class="{cls}"><div class="label">{label}</div>'
-            f'<div class="value">{_fmt_value(m["value"], m.get("unit", ""))}</div>'
-            f'<div class="formula">{m.get("formula", "") or "&nbsp;"}</div></div>')
+            f'<div class="value">{_e(_fmt_value(m["value"], m.get("unit", "")))}</div>'
+            f'<div class="formula">{_e(m.get("formula", "")) or "&nbsp;"}</div></div>')
     return f'<div class="cards">{"".join(cards)}</div>' if cards else ''
 
 
@@ -1299,14 +1580,14 @@ def _caliber_compare_html(cc: dict) -> str:
     if not cc:
         return ''
     items = ''.join(
-        f'<div class="cc-item"><div class="cc-name">{it["name"]}</div>'
-        f'<div class="cc-value">{_fmt_value(it["value"], it.get("unit", ""))}</div>'
-        f'<div class="cc-desc">{it.get("desc", "")}</div></div>'
+        f'<div class="cc-item"><div class="cc-name">{_e(it["name"])}</div>'
+        f'<div class="cc-value">{_e(_fmt_value(it["value"], it.get("unit", "")))}</div>'
+        f'<div class="cc-desc">{_e(it.get("desc", ""))}</div></div>'
         for it in cc['items'])
     return f'''
-<h2>口径对比 · {cc['label']}</h2>
+<h2>口径对比 · {_e(cc['label'])}</h2>
 <div class="cc">{items}</div>
-<p class="cc-note">{cc.get('note', '')}</p>'''
+<p class="cc-note">{_e(cc.get('note', ''))}</p>'''
 
 
 def _anomaly_html(anomalies: list[dict]) -> str:
@@ -1317,9 +1598,9 @@ def _anomaly_html(anomalies: list[dict]) -> str:
     for a in anomalies[:8]:                 # 最多展示 8 天
         feats = '；'.join(a['features'])
         rows.append(
-            f'<tr><td class="mono">{a["date"][5:]}</td>'
-            f'<td>{feats}</td>'
-            f'<td class="note">{a.get("note", "")}</td></tr>')
+            f'<tr><td class="mono">{_e(a["date"][5:])}</td>'
+            f'<td>{_e(feats)}</td>'
+            f'<td class="note">{_e(a.get("note", ""))}</td></tr>')
     return f'''
 <h2>异常日定位</h2>
 <p class="sec-desc">基线 = 前 7 日均值；偏离 ≥35% 的日子。特征是观察到的事实，
@@ -1338,21 +1619,21 @@ def _products_html(products: list[dict]) -> str:
         flags = ('<span class="flag">重点关注</span>' if p['flags'] else '')
         reasons = (f'<span class="reason">{p["top_refund_reason"]}</span>'
                    if p['top_refund_reason'] and p['refund_amount'] > 0 else '—')
-        title = p['title'] or p['merchant_code'] or p['item_id']
+        title = _e(p['title'] or p['merchant_code'] or p['item_id'])
         rows.append(
             f'<tr><td>{title}{flags}</td>'
-            f'<td class="num">{_fmt_value(p["share"], "percent")}</td>'
+            f'<td class="num">{_e(_fmt_value(p["share"], "percent"))}</td>'
             f'<td class="num">¥{p["pay_amount"]:,.0f}</td>'
             f'<td class="num">¥{p["net_sales"]:,.0f}</td>'
-            f'<td class="num">{_fmt_value(p["refund_rate"], "percent")}</td>'
-            f'<td>{reasons}</td>'
-            f'<td class="num">{_fmt_value(p["margin_rate"], "percent")}</td></tr>')
+            f'<td class="num">{_e(_fmt_value(p["refund_rate"], "percent"))}</td>'
+            f'<td>{_e(reasons)}</td>'
+            f'<td class="num">{_e(_fmt_value(p["margin_rate"], "percent"))}</td></tr>')
     flagged = [p for p in products if p['flags']]
     hint = ''
     if flagged:
-        names = '、'.join((p['title'] or p['merchant_code'] or p['item_id'])
-                          for p in flagged)
-        reasons_txt = '；'.join(sorted({f for p in flagged for f in p['flags']}))
+        names = _e('、'.join((p['title'] or p['merchant_code'] or p['item_id'])
+                              for p in flagged))
+        reasons_txt = _e('；'.join(sorted({f for p in flagged for f in p['flags']})))
         hint = (f'<p class="sec-desc">⚠ 重点关注：{names} —— {reasons_txt}。'
                 f'退款原因与商品明细见「退款售后明细」数据源。</p>')
     return f'''
@@ -1380,7 +1661,7 @@ def _weekly_html(weekly: dict) -> str:
         cvr = (f'{w["pay_cvr"] * 100:.2f}%' if w.get('pay_cvr') is not None else '—')
         roi = f'{w["roi"]:.1f}' if w.get('roi') is not None else '—'
         rows.append(
-            f'<tr><td class="mono">{wk_label(w["label"], w.get("days", 7))}</td>'
+            f'<tr><td class="mono">{_e(wk_label(w["label"], w.get("days", 7)))}</td>'
             f'<td class="num">{w["visitors"]:,}</td>'
             f'<td class="num">{cvr}</td>'
             f'<td class="num">¥{w["net_sales"]:,.0f}</td>'
@@ -1429,26 +1710,31 @@ def _build_html(data: dict) -> str:
                   if lvl == 'medium' else
                   '<span class="badge ok">已核实</span>'))
         rows.append(
-            f'<tr><td>{m.get("metric_name","")}</td>'
-            f'<td class="num">{_fmt_value(m.get("value"), m.get("unit",""))}</td>'
-            f'<td class="formula">{m.get("formula","")}</td>'
+            f'<tr><td>{_e(m.get("metric_name",""))}</td>'
+            f'<td class="num">{_e(_fmt_value(m.get("value"), m.get("unit","")))}</td>'
+            f'<td class="formula">{_e(m.get("formula",""))}</td>'
             f'<td>{badge}</td></tr>')
 
-    warns = ''.join(f'<li>{w}</li>' for w in data.get('warnings', []))
-    footnote = (data.get('footnote', '') or
-                '所有指标口径均已核实。').replace('\n', '<br>')
+    # ★ 警告文本可能含 Excel 原始内容（商家编码、清洗失败样例），必须转义
+    #   —— 完整报告 XSS 加固见 docs/16 P1-17（批次 3）
+    warns = ''.join(f'<li>{html.escape(str(w))}</li>'
+                    for w in data.get('warnings', []))
+    footnote = _e(data.get('footnote', '') or
+                  '所有指标口径均已核实。').replace('\n', '<br>')
     src = data.get('source', {})
     tr = data.get('time_range') or {}
-    period = (f"{tr.get('start', '')} ~ {tr.get('end', '')}"
-              if tr.get('start') else '全部数据')
+    period = _e(f"{tr.get('start', '')} ~ {tr.get('end', '')}"
+                if tr.get('start') else '全部数据')
     anomaly_dates = {a['date'] for a in anomalies}
     trend_svg = _svg_trend(trend, anomaly_dates)
     cards = _metric_cards(metrics)
-    files = '、'.join(f"{f['name']}({f['rows']}行)" for f in src.get('files', [])[:6])
+    files = '、'.join(
+        f'{_e(f.get("name", ""))}({int(f.get("rows", 0) or 0)}行)'
+        for f in src.get('files', [])[:6])
 
     caliber_line = ''
     if caliber.get('registry_version'):
-        caliber_line = (f'<span>口径版本 <b>{caliber["registry_version"]}</b>'
+        caliber_line = (f'<span>口径版本 <b>{_e(caliber["registry_version"])}</b>'
                         f'（本次计算快照已随报告存档）</span>')
 
     legend_extra = ('<span><span class="k a">▍</span>异常日</span>'
@@ -1531,9 +1817,9 @@ def _build_html(data: dict) -> str:
 
 <div class="meta">
   <span>统计周期 <b>{period}</b></span>
-  <span>数据源 <b>{src.get('file_count', 0)}</b> 个 / {src.get('row_count', 0):,} 行</span>
-  <span>报告编号 <b>{data.get('diagnosis_id', '')[:12]}</b></span>
-  <span>生成时间 {data.get('generated_at', '')[:19].replace('T', ' ')}</span>
+  <span>数据源 <b>{int(src.get('file_count', 0) or 0)}</b> 个 / {int(src.get('row_count', 0) or 0):,} 行</span>
+  <span>报告编号 <b>{_e(str(data.get('diagnosis_id', ''))[:12])}</b></span>
+  <span>生成时间 {_e(str(data.get('generated_at', ''))[:19].replace('T', ' '))}</span>
 </div>
 
 {cards}

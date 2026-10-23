@@ -249,6 +249,45 @@ check('列不同指纹不同', fp1 != fp3)
 h1 = taobao.file_sha256(orders_path)
 check('文件哈希稳定', h1 == taobao.file_sha256(orders_path), h1[:16])
 
+# ---------- 10. 数值清洗失败可追溯（docs/16 P1-10）----------
+print('\n[10] 数值清洗失败记录')
+bad: dict[str, dict] = {}
+v = taobao.coerce_for_table('stg_trade_orders', 'pay_amount', 'abc', bad)
+check('非法金额置 NULL', v is None, v)
+check('★ 失败值被收集（BAD_AMOUNT）',
+      bad.get('pay_amount', {}).get('count') == 1, bad)
+check('收集了原文示例', 'abc' in bad.get('pay_amount', {}).get('samples', []),
+      bad.get('pay_amount', {}).get('samples'))
+taobao.coerce_for_table('stg_trade_orders', 'pay_amount', '--', bad)
+check('空值不算清洗失败', bad['pay_amount']['count'] == 1, bad['pay_amount'])
+v2 = taobao.coerce_for_table('stg_trade_orders', 'pay_amount', '1,234.56', bad)
+check('正常金额转换正确', v2 == 1234.56, v2)
+check('死三元已修复（float 解析失败返回 None）',
+      taobao._coerce_typed('float', 'abc') is None
+      and taobao._coerce_typed('int', 'abc') is None)
+
+# ---------- 11. 行数上限截断告警（docs/16 P1-11）----------
+print('\n[11] 行数上限截断')
+trunc_path = TMP / 'truncated.csv'
+tb = io.StringIO()
+tw = csv.writer(tb)
+tw.writerow(traffic_headers)
+for i in range(5):
+    tw.writerow(['2026-10-0%d' % (i + 1), str(100 + i)] + ['0'] * 11)
+trunc_path.write_bytes(tb.getvalue().encode('utf-8'))
+_orig_max = taobao.MAX_READ_ROWS
+taobao.MAX_READ_ROWS = 3
+try:
+    rr = taobao.read_file(trunc_path)
+    check('★ 截断标记为 True', rr.truncated, rr.truncated)
+    check('★ 截断产生 warning',
+          any('上限' in w for w in rr.warnings), rr.warnings)
+    prep = taobao.prepare(trunc_path)
+    check('★ 截断要求人工确认', prep.needs_confirmation(),
+          prep.spec.key if prep.spec else None)
+finally:
+    taobao.MAX_READ_ROWS = _orig_max
+
 print()
 print('=' * 76)
 print('模块 3: ' + ('全部通过' if not fails else f'{len(fails)} 项失败 -> {fails}'))

@@ -15,7 +15,9 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI, HTTPException, Request, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
+from starlette.concurrency import run_in_threadpool
 
+from app.api.routes import admin as admin_routes
 from app.api.routes import auth as auth_routes
 from app.api.routes import billing as billing_routes
 from app.api.routes import chat as chat_routes
@@ -57,6 +59,25 @@ async def lifespan(app: FastAPI):
     db.apply_schema()
     logger.info('数据库就绪: %s', s.database_path)
 
+    # 未启用邮箱验证的部署：历史用户视为已核验（避免前端误提示）
+    if not s.email_verification_required:
+        from app.services import auth as auth_svc
+        try:
+            await run_in_threadpool(auth_svc.backfill_legacy_verified)
+        except Exception:                   # noqa: BLE001
+            logger.exception('历史用户邮箱核验回填失败')
+
+    # ★ 启动对账（docs/16 P1-3）：daemon 线程随进程消失后，遗留的
+    #   running 诊断会永久卡死、已扣额度无退款路径。启动时标记失败并
+    #   幂等补退款，同时重试补偿表里的待退款。同步 DB 操作放线程池执行。
+    from app.services import diagnosis as diagnosis_svc
+    try:
+        stats = await run_in_threadpool(diagnosis_svc.reconcile_on_startup)
+        logger.info('启动对账完成: %s', stats)
+    except Exception:                       # noqa: BLE001
+        # 对账失败不阻断启动：后续每次诊断失败仍会退款，补偿表保留待重试
+        logger.exception('启动对账失败')
+
     # 确保租户根目录存在
     s.tenants_path.mkdir(parents=True, exist_ok=True)
     s.log_path.mkdir(parents=True, exist_ok=True)
@@ -87,6 +108,8 @@ def create_app() -> FastAPI:
         lifespan=lifespan,
         docs_url='/docs' if not s.is_production else None,
         redoc_url=None,
+        # ★ 生产环境连 openapi.json 也关闭（docs/16 P2-15）
+        openapi_url=None if s.is_production else '/openapi.json',
     )
 
     # ---- CORS（生产必须明确域名，禁止 *）----
@@ -122,6 +145,7 @@ def create_app() -> FastAPI:
     # ---- 路由 ----
     api = '/api/v1'
     app.include_router(auth_routes.router, prefix=api)
+    app.include_router(admin_routes.router, prefix=api)
     app.include_router(sample_routes.router, prefix=api)
     app.include_router(source_routes.router, prefix=api)
     app.include_router(diag_routes.router, prefix=api)
@@ -130,22 +154,16 @@ def create_app() -> FastAPI:
 
     # ---- 健康检查（无需登录）----
     @app.get('/api/v1/health', response_model=HealthResponse,
-             tags=['系统'], summary='健康检查')
+             tags=['系统'], summary='健康检查（公开，仅状态）')
     async def health():
-        cfg = get_settings()
+        # ★ 公开端点不泄露 DB 路径/表名/沙箱细节（docs/16 P2-13）；
+        #   详情在管理员接口 /admin/health。
         try:
-            dbh = db.health_check()
-        except Exception as e:                      # noqa: BLE001
-            dbh = {'ok': False, 'error': str(e)}
-
-        return HealthResponse(
-            status='ok' if dbh.get('ok') else 'degraded',
-            version=VERSION,
-            database=dbh,
-            sandbox={
-                'network_isolated': cfg.sandbox_network_isolated,
-                'mode': cfg.sandbox_mode,
-            })
+            ok = bool(db.health_check().get('ok'))
+        except Exception:                           # noqa: BLE001
+            ok = False
+        return HealthResponse(status='ok' if ok else 'degraded',
+                              version=VERSION)
 
     return app
 

@@ -19,6 +19,8 @@ os.environ['SIGNUP_FREE_CREDITS'] = '0'
 os.environ['TENANTS_ROOT'] = str(TMP / 'tenants')
 os.environ['APP_ENV'] = 'development'
 os.environ['APP_DEBUG'] = 'true'
+os.environ['SUPER_ADMIN_EMAILS'] = 'platform@admin.com'
+os.environ['MAX_UPLOAD_MB'] = '1'          # 便于验证上传大小前置限制（P1-14）
 
 from app.config import reset_settings_cache
 reset_settings_cache()
@@ -51,7 +53,8 @@ print(f'  db tables={h["database"].get("tables")} journal={h["database"].get("jo
 print(f'  sandbox={h["sandbox"]}')
 check('健康检查 200', r.status_code == 200)
 check('状态 ok', h['status'] == 'ok')
-check('沙箱网络隔离为 true', h['sandbox']['network_isolated'] is True)
+check('★ 公开 health 不泄露 DB/沙箱详情（P2-13）',
+      not h.get('database') and not h.get('sandbox'), h)
 
 # ===========================================================================
 print('\n[2] 未认证访问被拒绝')
@@ -98,6 +101,12 @@ print('\n[4] 登录与当前用户')
 r = client.post('/api/v1/auth/login', json={
     'email': 'boss@shop.com', 'password': 'MyStr0ng!Pass'})
 check('登录成功', r.status_code == 200, r.status_code)
+_set_cookie = r.headers.get('set-cookie', '').lower()
+check('★ refresh 走 httpOnly cookie（P2-16）',
+      'daa_refresh=' in _set_cookie and 'httponly' in _set_cookie,
+      r.headers.get('set-cookie', '')[:120])
+check('cookie 限定了路径与 SameSite',
+      'path=/api/v1/auth' in _set_cookie and 'samesite=lax' in _set_cookie)
 
 r = client.post('/api/v1/auth/login', json={
     'email': 'boss@shop.com', 'password': 'WrongPass1!'})
@@ -112,6 +121,11 @@ check('刷新令牌成功', r.status_code == 200, r.status_code)
 NEW_REFRESH = r.json()['refresh_token']
 r = client.post('/api/v1/auth/refresh', json={'refresh_token': REFRESH})
 check('旧 refresh 失效', r.status_code == 401, r.status_code)
+check('★ 错误码 TOKEN_REVOKED', r.json().get('code') == 'TOKEN_REVOKED',
+      r.text[:80])
+# ★ 重放检测：旧 token 被重放后，同族的新 token 也应被整族吊销
+r = client.post('/api/v1/auth/refresh', json={'refresh_token': NEW_REFRESH})
+check('★ 同族 refresh 被连带吊销', r.status_code == 401, r.status_code)
 REFRESH = NEW_REFRESH
 
 # ===========================================================================
@@ -222,6 +236,14 @@ r = client.post('/api/v1/sources', headers=H,
                 files={'file': ('noise.csv', b'name,age\nTom,30\n', 'text/csv')})
 check('拒绝无法识别的文件', r.status_code == 422, r.status_code)
 
+# ★ 大文件前置拒绝（docs/16 P1-14；本测试 MAX_UPLOAD_MB=1）
+_big = b'date,visitors\n' + b'2026-10-01,1\n' * 120_000   # ≈ 1.3 MB
+r = client.post('/api/v1/sources', headers=H,
+                files={'file': ('big.csv', _big, 'text/csv')})
+check('★ 超大文件返回 413', r.status_code == 413, r.status_code)
+check('错误码 FILE_TOO_LARGE', r.json().get('code') == 'FILE_TOO_LARGE',
+      r.text[:100])
+
 # ===========================================================================
 print('\n[8] 数据画像')
 SID = uploads['订单导出.csv']['source_id']
@@ -269,7 +291,7 @@ check('错误码 INSUFFICIENT_CREDITS',
       r.json().get('code') == 'INSUFFICIENT_CREDITS')
 
 # ===========================================================================
-print('\n[11] 购买 → 人工核销')
+print('\n[11] 购买 → 人工核销（仅平台管理员）')
 r = client.post('/api/v1/billing/orders', headers=H, json={'sku': 'pack5'})
 check('创建订单 201', r.status_code == 201, r.status_code)
 order = r.json()
@@ -277,8 +299,34 @@ print(f'  订单 {order["order_no"]}  ¥{order["amount_yuan"]:.0f}  {order["quan
 check('订单金额 ¥799', order['amount_cents'] == 79900)
 check('订单 5 次', order['quantity'] == 5)
 
+# ★ P0-1 负向测试：租户 owner 自助核销必须被拒（否则 = 免费无限拿额度）
 r = client.post(f'/api/v1/billing/orders/{order["order_no"]}/confirm', headers=H)
-check('人工核销 200', r.status_code == 200, r.text[:120])
+check('★ owner 自助核销被拒 403', r.status_code == 403, r.status_code)
+check('★ 错误码 FORBIDDEN', r.json().get('code') == 'FORBIDDEN')
+acc = client.get('/api/v1/billing/account', headers=H).json()
+check('★ 核销被拒后余额仍为 0', acc['balance'] == 0, acc['balance'])
+
+# 平台管理员（SUPER_ADMIN_EMAILS 白名单）核销
+r = client.post('/api/v1/auth/register', json={
+    'email': 'platform@admin.com', 'password': 'PlatformAdmin!2026',
+    'tenant_name': '平台管理'})
+check('注册管理员 201', r.status_code == 201, r.status_code)
+check('★ role=admin', r.json()['user']['role'] == 'admin',
+      r.json()['user'].get('role'))
+ADMIN_TOKEN = r.json()['token']['access_token']
+H_ADMIN = {'Authorization': f'Bearer {ADMIN_TOKEN}'}
+
+r = client.get('/api/v1/admin/health', headers=H_ADMIN)
+check('管理员可看运维详情', r.status_code == 200, r.status_code)
+if r.status_code == 200:
+    hd = r.json()
+    check('详情含数据库与沙箱',
+          hd.get('database', {}).get('tables', 0) >= 15
+          and hd.get('sandbox', {}).get('network_isolated') is True, hd)
+
+r = client.post(f'/api/v1/billing/orders/{order["order_no"]}/confirm',
+                headers=H_ADMIN)
+check('管理员核销 200', r.status_code == 200, r.text[:120])
 acc = r.json()
 print(f'  核销后余额: {acc["balance"]}')
 check('余额 5', acc['balance'] == 5, acc['balance'])
@@ -321,6 +369,29 @@ for e in events[:6]:
 check('收到 ready 事件', any(e.get('type') == 'ready' for e in events))
 check('收到 progress 事件', any(e.get('type') == 'progress' for e in events))
 check('收到 done 事件', any(e.get('type') == 'done' for e in events))
+check('★ 事件含单调 seq（去重依据）',
+      all(e.get('seq', 0) > 0 for e in events if e.get('type') == 'progress'))
+
+# ★ P2-24：两个订阅者各自拿到同一事件（旧实现互相抢队列）
+from app.api.routes import diagnoses as _dr              # noqa: E402
+_dr._drop_queue('sse-test')
+_q1 = _dr._subscribe('sse-test')
+_q2 = _dr._subscribe('sse-test')
+_dr._emit('sse-test', {'type': 'progress', 'phase': 'x', 'message': 'm'})
+_e1, _e2 = _q1.get_nowait(), _q2.get_nowait()
+check('★ 双订阅者都收到事件',
+      _e1.get('seq') == _e2.get('seq') == 1,
+      (_e1.get('seq'), _e2.get('seq')))
+_dr._drop_queue('sse-test')
+check('订阅/历史可清理', 'sse-test' not in _dr._progress
+      and 'sse-test' not in _dr._history)
+# TTL 兜底清理
+_dr._subscribe('ttl-test')
+with _dr._lock:
+    _dr._last_activity['ttl-test'] = (
+        time.monotonic() - _dr._PROGRESS_TTL_SECONDS - 1)
+_dr._sweep_progress()
+check('★ TTL 清理无活动进度', 'ttl-test' not in _dr._progress)
 
 # ===========================================================================
 print('\n[14] 诊断结果')
@@ -353,6 +424,11 @@ r = client.get(f'/api/v1/diagnoses/{DID}/report', headers=H)
 check('报告 200', r.status_code == 200, r.status_code)
 check('Content-Type 为 HTML',
       'text/html' in r.headers.get('content-type', ''), r.headers.get('content-type'))
+check('★ 报告带严格 CSP（P1-17）',
+      "default-src 'none'" in r.headers.get('content-security-policy', ''),
+      r.headers.get('content-security-policy', '')[:80])
+check('报告 nosniff',
+      r.headers.get('x-content-type-options') == 'nosniff')
 html = r.text
 check('报告含 HTML 结构', '<!DOCTYPE html>' in html)
 check('报告含指标', '访客数' in html or '净销售额' in html)
@@ -406,13 +482,17 @@ check('★ 跨租户读报告被拒', r.status_code == 404, r.status_code)
 r = client.get(f'/api/v1/diagnoses/{DID}/events', headers=H2)
 check('★ 跨租户订阅 SSE 被拒', r.status_code == 404, r.status_code)
 
+# B 想看运维详情（平台管理员专属）
+r = client.get('/api/v1/admin/health', headers=H2)
+check('★ 非管理员看运维详情 403', r.status_code == 403, r.status_code)
+
 # B 想查 A 的订单
 r = client.get(f'/api/v1/billing/orders/{order["order_no"]}', headers=H2)
 check('★ 跨租户查订单被拒', r.status_code == 404, r.status_code)
 
-# B 想确认 A 的订单（白嫖额度）
+# B 想确认 A 的订单（白嫖额度）——非管理员一律 403
 r = client.post(f'/api/v1/billing/orders/{order["order_no"]}/confirm', headers=H2)
-check('★ 跨租户确认收款被拒', r.status_code == 404, r.status_code)
+check('★ 非管理员确认收款被拒', r.status_code == 403, r.status_code)
 
 # B 用 A 的数据源发起诊断
 r = client.post('/api/v1/diagnoses', headers=H2,
@@ -425,11 +505,26 @@ r = client.get('/api/v1/billing/account', headers=H2)
 check('★ 两租户额度独立', r.json()['balance'] == 0, r.json()['balance'])
 
 # ===========================================================================
+print('\n[17.5] cookie 刷新（不带 body）')
+r = client.post('/api/v1/auth/login', json={
+    'email': 'boss@shop.com', 'password': 'MyStr0ng!Pass'})
+check('重新登录 200', r.status_code == 200, r.status_code)
+r = client.post('/api/v1/auth/refresh')          # 无 body，仅 cookie
+check('★ 仅凭 cookie 可刷新', r.status_code == 200, r.status_code)
+check('返回新 access token', bool(r.json().get('access_token')))
+
+# ===========================================================================
 print('\n[18] 登出')
 r = client.post('/api/v1/auth/logout', headers=H)
 check('登出 200', r.status_code == 200)
+check('★ 登出清除 refresh cookie', 'daa_refresh' not in client.cookies,
+      dict(client.cookies))
 r = client.post('/api/v1/auth/refresh', json={'refresh_token': REFRESH})
 check('登出后 refresh 失效', r.status_code == 401, r.status_code)
+# ★ P1-18：登出后旧 access token 也必须失效（token_valid_after 水位）
+r = client.get('/api/v1/auth/me', headers=H)
+check('★ 登出后旧 access token 失效 401', r.status_code == 401,
+      r.status_code)
 
 print()
 print('=' * 78)

@@ -1,6 +1,13 @@
-"""额度与订单路由。"""
+"""额度与订单路由。
+
+★ 全部为同步 def（非 async）：FastAPI 自动放入线程池执行 ——
+  SQLite 写事务遇锁时最长等待 busy_timeout=5s，跑在事件循环里
+  会冻结全站请求（docs/16 P0-7）。
+"""
 
 from __future__ import annotations
+
+import logging
 
 from fastapi import APIRouter, HTTPException, status
 
@@ -11,14 +18,18 @@ from app.api.schemas import (
 from app.services import billing
 
 router = APIRouter(prefix='/billing', tags=['额度与订单'])
+logger = logging.getLogger(__name__)
 
 
 def _handle(e: Exception) -> HTTPException:
     if isinstance(e, billing.BillingError):
         return HTTPException(status_code=status.HTTP_400_BAD_REQUEST,
                              detail={'code': e.code, 'message': e.message})
+    # ★ 未知异常不把内部细节回给客户端（docs/16 P2-14），只进日志
+    logger.exception('计费接口未处理异常: %s', e)
     return HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                         detail={'code': 'INTERNAL', 'message': str(e)})
+                         detail={'code': 'INTERNAL',
+                                 'message': '服务内部错误'})
 
 
 def _account_resp(acc: billing.CreditAccount) -> AccountResponse:
@@ -27,25 +38,25 @@ def _account_resp(acc: billing.CreditAccount) -> AccountResponse:
 
 
 @router.get('/plans', response_model=list[PlanResponse], summary='套餐清单')
-async def plans():
+def plans():
     """公开接口（无需登录），供定价页展示。"""
     return [PlanResponse(**p) for p in billing.pricing_plans()]
 
 
 @router.get('/account', response_model=AccountResponse, summary='我的额度')
-async def account(ctx: Ctx):
+def account(ctx: Ctx):
     return _account_resp(billing.get_account(ctx.tenant_id))
 
 
 @router.get('/orders', response_model=list[OrderResponse], summary='订单列表')
-async def list_orders(ctx: Ctx, limit: int = 50):
+def list_orders(ctx: Ctx, limit: int = 50):
     return [OrderResponse(**o.to_dict())
             for o in billing.list_orders(ctx.tenant_id, limit=limit)]
 
 
 @router.post('/orders', response_model=OrderResponse,
              status_code=status.HTTP_201_CREATED, summary='创建订单')
-async def create_order(ctx: Ctx, req: CreateOrderRequest):
+def create_order(ctx: Ctx, req: CreateOrderRequest):
     """创建待支付订单。
 
     当前支付渠道为**人工核销**（BILLING_PROVIDER=manual）：
@@ -61,7 +72,7 @@ async def create_order(ctx: Ctx, req: CreateOrderRequest):
 
 @router.get('/orders/{order_no}', response_model=OrderResponse,
             summary='查询订单')
-async def get_order(ctx: Ctx, order_no: str):
+def get_order(ctx: Ctx, order_no: str):
     o = billing.get_order_by_no(order_no)
     if o is None or o.tenant_id != ctx.tenant_id:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND,
@@ -72,7 +83,7 @@ async def get_order(ctx: Ctx, order_no: str):
 
 @router.post('/orders/{order_no}/cancel', response_model=OrderResponse,
              summary='取消订单')
-async def cancel_order(ctx: Ctx, order_no: str):
+def cancel_order(ctx: Ctx, order_no: str):
     o = billing.get_order_by_no(order_no)
     if o is None or o.tenant_id != ctx.tenant_id:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND,
@@ -86,13 +97,13 @@ async def cancel_order(ctx: Ctx, order_no: str):
 
 
 @router.get('/ledger', response_model=list[LedgerEntry], summary='额度流水')
-async def ledger(ctx: Ctx, limit: int = 100):
+def ledger(ctx: Ctx, limit: int = 100):
     """额度增减明细（客服对账用）。"""
     return [LedgerEntry(**e) for e in billing.list_ledger(ctx.tenant_id, limit)]
 
 
 @router.get('/usage', summary='用量与成本')
-async def usage(ctx: Ctx):
+def usage(ctx: Ctx):
     """Token 与成本汇总。reasoning_tokens 单独统计（推理模型必需）。"""
     return {
         'usage': billing.usage_summary(ctx.tenant_id),
@@ -105,21 +116,23 @@ async def usage(ctx: Ctx):
 # ---------------------------------------------------------------------------
 
 @router.post('/orders/{order_no}/confirm', response_model=AccountResponse,
-             summary='确认收款（人工核销）')
-async def confirm_payment(ctx: Ctx, order_no: str,
-                          provider_trade_no: str = ''):
-    """管理员确认收到款项 → 订单转 paid → 额度入账。
+             summary='确认收款（人工核销，仅平台管理员）')
+def confirm_payment(ctx: Ctx, order_no: str,
+                    provider_trade_no: str = ''):
+    """平台管理员确认收到款项 → 订单转 paid → 额度入账。
 
-    ⚠️ 生产环境应限制为管理员角色；当前单租户 MVP 允许 owner 操作。
-    支付宝商户号就绪后，改为由回调接口自动调用 billing.mark_paid()。
+    ★ 仅限平台管理员（role=admin，SUPER_ADMIN_EMAILS 白名单）。
+      租户 owner 不能核销任何订单 —— 包括自己租户的（docs/16 P0-1：
+      自助核销 = 免费无限拿额度）。管理员跨租户操作是人工核销的本意。
+      支付宝商户号就绪后，改为由回调接口自动调用 billing.mark_paid()。
     """
-    if not ctx.user.is_owner:
+    if not ctx.user.is_admin:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN,
                             detail={'code': 'FORBIDDEN',
-                                    'message': '需要店铺管理员权限'})
+                                    'message': '仅平台管理员可确认收款'})
 
     o = billing.get_order_by_no(order_no)
-    if o is None or o.tenant_id != ctx.tenant_id:
+    if o is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND,
                             detail={'code': 'ORDER_NOT_FOUND',
                                     'message': f'订单不存在: {order_no}'})

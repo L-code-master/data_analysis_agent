@@ -370,6 +370,31 @@ check('有 semantic.duckdb', any('semantic.duckdb' in f for f in files))
 usage = tn.tenant_usage(TID)
 print(f'  磁盘用量: {usage["files"]} 文件 / {usage["mb"]} MB')
 
+# ===========================================================================
+print('\n[10] 报告 XSS 转义（docs/16 P1-17）')
+evil = '<img src=x onerror=alert(1)>'
+evil_data = {
+    'diagnosis_id': 'abc123', 'generated_at': '2026-10-23T00:00:00',
+    'time_range': None,
+    'source': {'name': evil, 'file_count': 1, 'row_count': 1,
+               'files': [{'name': evil, 'rows': 1}]},
+    'metrics': [{'metric_id': 'M01', 'metric_name': evil, 'value': evil,
+                 'unit': 'count', 'formula': evil, 'uncertainty': 'low'}],
+    'trend': [], 'anomaly_days': [],
+    'products': [{'item_id': '1', 'merchant_code': evil, 'title': evil,
+                  'pay_amount': 100, 'share': 1.0, 'net_sales': 90,
+                  'quantity': 1, 'refund_amount': 0, 'refund_rate': 0,
+                  'gross_margin': 50, 'margin_rate': 0.5,
+                  'top_refund_reason': evil, 'flags': []}],
+    'weekly': {}, 'caliber_compare': {},
+    'caliber': {'registry_version': evil},
+    'footnote': evil, 'warnings': [evil],
+}
+evil_html = dg._build_html(evil_data)
+check('★ 动态文本已转义（无原始 <img）', '<img' not in evil_html)
+check('★ 保留可见的转义文本', '&lt;img' in evil_html)
+check('★ 无 <script> 注入', '<script' not in evil_html.lower())
+
 print()
 print('=' * 78)
 print('模块 6c: ' + ('全部通过' if not fails else f'{len(fails)} 项失败 -> {fails}'))

@@ -106,8 +106,9 @@ for i in range(2):                      # 第 2、3 次失败
 try:
     auth.login('boss@shop.com', 'MyStr0ng!Pass')   # 正确密码也被锁
     check('达阈值后锁定（正确密码也拒绝）', False)
-except auth.AccountLockedError as e:
-    check('达阈值后锁定（正确密码也拒绝）', True, e.message)
+except auth.InvalidCredentialsError as e:
+    check('★ 达阈值后锁定且返回通用文案（不泄露状态）',
+          e.code == 'INVALID_CREDENTIALS', e.message)
 
 # 解锁以便后续测试
 with db.transaction() as c:

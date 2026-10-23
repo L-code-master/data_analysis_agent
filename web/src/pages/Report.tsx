@@ -114,12 +114,18 @@ export default function ReportPage() {
   const [result, setResult] = useState<DiagnosisResult | null>(null)
   const [loading, setLoading] = useState(true)
   const [trace, setTrace] = useState<MetricValue | null>(null)
+  const [printing, setPrinting] = useState(false)
 
   useEffect(() => {
+    // ★ 切换报告时丢弃旧请求结果，避免慢响应覆盖新数据（docs/16 P1-20）
+    let cancelled = false
+    setLoading(true)
+    setResult(null)
     diagnosisApi.get(diagnosisId)
-      .then(setResult)
-      .catch((e) => message.error(errMsg(e)))
-      .finally(() => setLoading(false))
+      .then((r) => { if (!cancelled) setResult(r) })
+      .catch((e) => { if (!cancelled) message.error(errMsg(e)) })
+      .finally(() => { if (!cancelled) setLoading(false) })
+    return () => { cancelled = true }
   }, [diagnosisId])
 
   if (loading) return <div className="page"><Card loading variant="borderless" /></div>
@@ -368,8 +374,15 @@ export default function ReportPage() {
         title="核心指标"
         extra={
           <Space>
-            <Button size="small" icon={<PrinterOutlined />}
-                    onClick={() => window.open(diagnosisApi.reportUrl(diagnosisId), '_blank')}>
+            <Button size="small" icon={<PrinterOutlined />} loading={printing}
+                    onClick={() => {
+                      // ★ 带 JWT fetch 后用 blob 打开：window.open 无法携带
+                      //   Authorization 头，直接开 URL 会 401（docs/16 P0-3）
+                      setPrinting(true)
+                      diagnosisApi.openReport(diagnosisId)
+                        .catch((e: Error) => message.error(e.message))
+                        .finally(() => setPrinting(false))
+                    }}>
               打印 / 导出 PDF
             </Button>
           </Space>

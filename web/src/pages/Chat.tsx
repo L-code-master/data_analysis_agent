@@ -34,6 +34,8 @@ export default function ChatPage() {
   const [asking, setAsking] = useState(false)
   const [ctx, setCtx] = useState<ChatContext | null>(null)
   const bottomRef = useRef<HTMLDivElement>(null)
+  // ★ 当前会话 ID 的同步副本：慢响应回来时据此判断是否已切换会话
+  const activeIdRef = useRef('')
 
   const refreshCtx = () => {
     chatContextApi.get().then(setCtx).catch((e) => {
@@ -49,7 +51,9 @@ export default function ChatPage() {
       setSessions(list)
       if (list.length > 0) {
         setActive(list[0])
-        setMsgs(await chatApi.messages(list[0].session_id))
+        activeIdRef.current = list[0].session_id
+        const m = await chatApi.messages(list[0].session_id)
+        if (activeIdRef.current === list[0].session_id) setMsgs(m)
       }
     }).catch(() => {})
   }, [])
@@ -63,6 +67,7 @@ export default function ChatPage() {
       const s = await chatApi.createSession()
       setSessions((prev) => [s, ...prev])
       setActive(s)
+      activeIdRef.current = s.session_id
       setMsgs([])
     } catch (e) {
       message.error(errMsg(e))
@@ -71,16 +76,20 @@ export default function ChatPage() {
 
   const selectSession = async (s: ChatSession) => {
     setActive(s)
+    activeIdRef.current = s.session_id
     try {
-      setMsgs(await chatApi.messages(s.session_id))
+      const m = await chatApi.messages(s.session_id)
+      // ★ 慢响应回来时若已切到别的会话，丢弃旧结果（docs/16 P1-20）
+      if (activeIdRef.current === s.session_id) setMsgs(m)
     } catch {
-      setMsgs([])
+      if (activeIdRef.current === s.session_id) setMsgs([])
     }
   }
 
   const send = async () => {
     const q = input.trim()
     if (!q || !active || asking) return
+    const sid = active.session_id
     setInput('')
     setAsking(true)
     setMsgs((prev) => [...prev, {
@@ -88,12 +97,15 @@ export default function ChatPage() {
       route: '', meta: {}, created_at: new Date().toISOString(),
     }])
     try {
-      const ans = await chatApi.ask(active.session_id, q)
-      setMsgs((prev) => [...prev, {
-        message_id: `local-a-${Date.now()}`, role: 'assistant',
-        content: ans.answer, route: ans.route, meta: ans.meta,
-        created_at: new Date().toISOString(),
-      }])
+      const ans = await chatApi.ask(sid, q)
+      // ★ 回答回来时用户可能已切换会话 —— 不要把旧回答塞进新会话
+      if (activeIdRef.current === sid) {
+        setMsgs((prev) => [...prev, {
+          message_id: `local-a-${Date.now()}`, role: 'assistant',
+          content: ans.answer, route: ans.route, meta: ans.meta,
+          created_at: new Date().toISOString(),
+        }])
+      }
       refreshCtx()
     } catch (e: unknown) {
       // 402 = Agent 配额用尽（形态 A 永不限）—— 展示引导而不是报错样式

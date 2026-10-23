@@ -1,5 +1,5 @@
 -- ============================================================================
--- 淘宝店铺经营诊断 · 语义层 v1.0（建表 + ETL + 视图 + 指标注册 + 质量校验）
+-- 淘宝店铺经营诊断 · 语义层 v1.5（建表 + ETL + 视图 + 指标注册 + 质量校验）
 -- ============================================================================
 -- 适用运行时：DuckDB 1.1+（推荐，可直接读 Excel/CSV）
 --             PostgreSQL 14+（TEXT 存 JSON 的列升级为 jsonb）
@@ -36,7 +36,10 @@
 --   P3 维度白名单：由 sem_metric_dimension 单表控制
 --   P4 全量刷新：DELETE+INSERT 重建 DWD，可重复执行
 --   P5 不静默修补：数据问题落地为错误或质量失败，绝不用默认值兜底
+--      （COGS 缺批次保留 NULL + QC-06b；数值清洗失败落 BAD_AMOUNT；行数截断告警）
 --   P6 不确定即标注：宁可在报告里写"此口径待确认"，也不猜一个数出来
+--   P7 版本化：视图/注册表修订进 sem_schema_version，存量库由
+--      app/services/diagnosis.py 的 _migrate_semantic_db 按版本补丁
 -- ============================================================================
 
 
@@ -423,18 +426,48 @@ CREATE TABLE IF NOT EXISTS sem_quality_result (
     checked_at   TIMESTAMP
 );
 
+-- ★ 语义层版本（docs/16 P1-12）：视图与指标注册的存量库迁移按版本推进。
+--   新建库由本文件直接写入当前版本；旧库由 app/services/diagnosis.py 的
+--   _migrate_semantic_db 逐版本补丁，失败必须抛出（不再 except pass）。
+CREATE TABLE IF NOT EXISTS sem_schema_version (
+    version      INTEGER PRIMARY KEY,
+    description  TEXT,
+    applied_at   TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+INSERT INTO sem_schema_version (version, description)
+SELECT 4, 'v1.5 COGS 不静默兜底 + 流量口径过滤 + M17 维度限制 + 广告费分摊'
+WHERE NOT EXISTS (SELECT 1 FROM sem_schema_version WHERE version = 4);
+
 
 -- ===== S5 ETL：STG → DWD（全量刷新，可重复执行） =====
 
 DELETE FROM dwd_etl_errors WHERE run_id = 'v1-full-refresh';
 
 -- S5.1 流量
+-- ★ 口径归一（docs/16 P1-9）：
+--   stat_scope 统一为 SHOP / ITEM；source_channel 统一用 TOTAL 表示"未拆分渠道"。
+--   生意参谋导出的「合计行 + 分渠道行」「店铺级 + 商品级」必须能被区分，
+--   否则 SUM 会把同一批访客重复计数（指标层再用 base_filter 只取
+--   SHOP + TOTAL，见 S7）。
 DELETE FROM dwd_traffic_daily;
 INSERT INTO dwd_traffic_daily
 SELECT stat_date,
-       COALESCE(NULLIF(stat_scope, ''), 'SHOP'),
+       CASE
+         WHEN stat_scope IS NULL OR TRIM(stat_scope) = '' THEN 'SHOP'
+         WHEN TRIM(stat_scope) IN ('店铺', '店铺级', '全店', 'SHOP', 'shop')
+           THEN 'SHOP'
+         WHEN TRIM(stat_scope) IN ('商品', '商品级', '单品', 'ITEM', 'item')
+           THEN 'ITEM'
+         ELSE TRIM(stat_scope)
+       END,
        COALESCE(item_id, ''),
-       COALESCE(NULLIF(source_channel, ''), 'TOTAL'),
+       CASE
+         WHEN source_channel IS NULL OR TRIM(source_channel) = '' THEN 'TOTAL'
+         WHEN TRIM(source_channel) IN ('合计', '总计', '全部', '所有终端',
+                                        'TOTAL', 'total')
+           THEN 'TOTAL'
+         ELSE TRIM(source_channel)
+       END,
        visitors, page_views, pay_buyers, pay_items, pay_amount,
        order_buyers, order_items, order_amount,
        cart_buyers, favorite_buyers
@@ -678,7 +711,10 @@ WITH sales AS (
 )
 SELECT s.stat_date, s.item_id, s.merchant_code,
        s.net_sales,
-       s.quantity * COALESCE(w.wac, 0) AS cogs,
+       -- ★ 缺批次时保留 NULL（docs/16 P1-8）：绝不用 0 兜底。
+       --   0 会把成本算成"免费"，让 M13/M14 毛利率虚高；NULL 会传到
+       --   gross_margin / margin_after_ads，由质量门 QC-06b 拦截。
+       s.quantity * w.wac AS cogs,
        -- 费用按该商品当日销售额占比分摊
        COALESCE(f.commission, 0)
          * s.net_sales / NULLIF(st.day_net_sales, 0)  AS commission,
@@ -688,22 +724,29 @@ SELECT s.stat_date, s.item_id, s.merchant_code,
          * s.net_sales / NULLIF(st.day_net_sales, 0)  AS shipping_fee_plat,
        COALESCE(f.other_fee, 0)
          * s.net_sales / NULLIF(st.day_net_sales, 0)  AS other_fee,
-       COALESCE(a.ad_spend, 0) AS ad_spend,
+       -- ★ 广告费与佣金同法按「当日销售额占比」分摊到商品行（docs/16 P0-4）。
+       --   本视图是 (日期×商品×商家编码) 粒度，日级广告总额若不摊、
+       --   M12 SUM(ad_spend) 会把一天的广告费按商品行数重复扣 N 次；
+       --   M14 的 margin_after_ads 同理。摊完后各商品行 ad_spend 之和 = 当日总花费。
+       COALESCE(COALESCE(a.ad_spend, 0)
+                  * s.net_sales / NULLIF(st.day_net_sales, 0), 0) AS ad_spend,
        -- 毛利（财务口径）= 净销售 - 商品成本 - 平台佣金 - 技术服务费
-       s.net_sales - s.quantity * COALESCE(w.wac, 0)
+       s.net_sales - s.quantity * w.wac
          - COALESCE(f.commission, 0) * s.net_sales / NULLIF(st.day_net_sales, 0)
          - COALESCE(f.tech_service, 0) * s.net_sales / NULLIF(st.day_net_sales, 0)
          AS gross_margin,
        CASE WHEN s.net_sales > 0 THEN
-         (s.net_sales - s.quantity * COALESCE(w.wac, 0)
+         (s.net_sales - s.quantity * w.wac
           - COALESCE(f.commission, 0) * s.net_sales / NULLIF(st.day_net_sales, 0)
           - COALESCE(f.tech_service, 0) * s.net_sales / NULLIF(st.day_net_sales, 0)
          ) / s.net_sales END AS gross_margin_rate,
-       -- 推广口径 = 财务口径再扣广告
-       s.net_sales - s.quantity * COALESCE(w.wac, 0)
+       -- 推广口径 = 财务口径再扣（已分摊的）广告
+       s.net_sales - s.quantity * w.wac
          - COALESCE(f.commission, 0) * s.net_sales / NULLIF(st.day_net_sales, 0)
          - COALESCE(f.tech_service, 0) * s.net_sales / NULLIF(st.day_net_sales, 0)
-         - COALESCE(a.ad_spend, 0) AS margin_after_ads
+         - COALESCE(COALESCE(a.ad_spend, 0)
+                      * s.net_sales / NULLIF(st.day_net_sales, 0), 0)
+         AS margin_after_ads
 FROM sales s
 LEFT JOIN sales_total st ON st.stat_date = s.stat_date
 LEFT JOIN wac w          ON w.merchant_code = s.merchant_code
@@ -845,6 +888,55 @@ SELECT 'Q' || (500 + ROW_NUMBER() OVER ()), 'v1-full-refresh', 'M11', 'QC-06', '
        CURRENT_TIMESTAMP
 FROM dwd_order_line WHERE merchant_code IS NULL OR merchant_code = '';
 
+-- QC-06b 有销量但无成本批次（docs/16 P1-8）
+--   ★ 成本缺批次时必须拦截，不能静默按 0 计算：漏传采购数据的租户
+--     会拿到虚高的 M13/M14，直接动摇"每个数字可溯源"。
+--   只有「数量 > 0 且有商家编码」的行参与判定；空商家编码由 QC-06 报。
+INSERT INTO sem_quality_result
+SELECT 'Q' || (510 + ROW_NUMBER() OVER ()), 'v1-full-refresh', 'M11',
+       'QC-06b', 'ERROR',
+       (COUNT(DISTINCT s.merchant_code) = 0),
+       '有销量的商家编码均有成本批次',
+       CAST(COUNT(DISTINCT s.merchant_code) AS TEXT),
+       '有销量但缺少成本批次的商家编码: '
+         || CAST(COUNT(DISTINCT s.merchant_code) AS TEXT)
+         || ' 个。请补传「采购成本」数据，或核对订单的商家编码后重试'
+         || '（COGS 不按 0 兜底）',
+       CURRENT_TIMESTAMP
+FROM v_sales_daily s
+WHERE s.quantity > 0
+  AND COALESCE(s.merchant_code, '') <> ''
+  AND NOT EXISTS (
+      SELECT 1 FROM dwd_cost_batch c WHERE c.merchant_code = s.merchant_code);
+
+-- 把缺批次的商家编码落到 ETL 错误表（WARN）—— 报告「计算提示」可见，
+-- 即使质量门放行（例如无销量只有退款行的边界情况）也不静默。
+DELETE FROM dwd_etl_errors
+WHERE run_id = 'v1-full-refresh' AND error_code = 'COGS_MISSING_BATCH';
+INSERT INTO dwd_etl_errors
+SELECT 'E' || (250 + ROW_NUMBER() OVER ()), 'v1-full-refresh',
+       'dwd_cost_batch', 'WARN', 'COGS_MISSING_BATCH',
+       '有销量但无成本批次的商家编码: ' || s.merchant_code
+         || '（COGS 留空，未按 0 兜底）',
+       'v_sales_daily', s.merchant_code, CURRENT_TIMESTAMP
+FROM (SELECT DISTINCT merchant_code FROM v_sales_daily
+      WHERE quantity > 0 AND COALESCE(merchant_code, '') <> '') s
+WHERE NOT EXISTS (
+    SELECT 1 FROM dwd_cost_batch c WHERE c.merchant_code = s.merchant_code);
+
+-- QC-10 数值清洗失败（docs/16 P1-10）
+--   导入层把无法解析的数值置 NULL 并写 BAD_AMOUNT；这里汇总成 WARN，
+--   报告「计算提示」会展示，不再静默变 NULL。
+INSERT INTO sem_quality_result
+SELECT 'Q' || (900 + ROW_NUMBER() OVER ()), 'v1-full-refresh', 'ALL',
+       'QC-10', 'WARN',
+       (COUNT(*) = 0), '0 条 BAD_AMOUNT',
+       CAST(COUNT(*) AS TEXT),
+       '数值字段清洗失败已置 NULL: ' || CAST(COUNT(*) AS TEXT) || ' 项',
+       CURRENT_TIMESTAMP
+FROM dwd_etl_errors
+WHERE run_id = 'v1-full-refresh' AND error_code = 'BAD_AMOUNT';
+
 -- QC-07 ETL 错误表 ERROR 级应为空
 INSERT INTO sem_quality_result
 SELECT 'Q' || (600 + ROW_NUMBER() OVER ()), 'v1-full-refresh', 'ALL', 'QC-07', 'ERROR',
@@ -894,7 +986,7 @@ VALUES
  '["访客数","访客","UV","流量","进店人数"]',
  '访问店铺页面或宝贝详情页的去重人数，一个人在统计时间内访问多次只记一次',
  'v_traffic_daily','SUM(visitors)',
- '{"agg":"SUM","expr":"visitors","unit":"count"}',
+ '{"agg":"SUM","expr":"visitors","unit":"count","base_filter":{"stat_scope":"SHOP","source_channel":"TOTAL"}}',
  '["day","week","month"]',
  '{"dedup":"同一人在统计时间范围内多次访问只记一次（淘宝官方口径）","multi_terminal":"所有终端访客数 = PC端 + 无线端直接相加（非去重相加）","known_issue":"流量高峰时可能出现访客数 < 支付买家数（淘宝已知现象，交易数据快于浏览数据）"}',
  '按淘宝生意参谋口径：去重人数；多终端为分端相加',
@@ -906,7 +998,7 @@ VALUES
  '["浏览量","PV","浏览次数"]',
  '店铺所有页面被访问的次数，一个人多次访问记为多次',
  'v_traffic_daily','SUM(page_views)',
- '{"agg":"SUM","expr":"page_views","unit":"count"}',
+ '{"agg":"SUM","expr":"page_views","unit":"count","base_filter":{"stat_scope":"SHOP","source_channel":"TOTAL"}}',
  '["day","week","month"]',
  '{"dedup":"不去重（与访客数相反）","multi_terminal":"所有终端浏览量 = PC端 + 无线端之和"}',
  '按淘宝口径：不去重的访问次数',
@@ -918,7 +1010,7 @@ VALUES
  '["支付转化率","转化率","CVR","成交转化率"]',
  '来访客户中最终完成支付的比例',
  'v_traffic_daily','pay_buyers / visitors',
- '{"agg":"RATIO","num_expr":"pay_buyers","num_agg":"SUM","den_expr":"visitors","den_agg":"SUM","unit":"percent"}',
+ '{"agg":"RATIO","num_expr":"pay_buyers","num_agg":"SUM","den_expr":"visitors","den_agg":"SUM","unit":"percent","base_filter":{"stat_scope":"SHOP","source_channel":"TOTAL"}}',
  '["day","week","month"]',
  '{"numerator":"支付买家数（不是支付件数、不是订单数）","denominator":"访客数（去重人数）","vs_order_cvr":"与「下单转化率」不同：支付转化率只看最终付款","uncertain":true,"interview_pending":["是否要用下单转化率替代观察"]}',
  '支付转化率 = 支付买家数 / 访客数（淘宝官方口径）',
@@ -930,7 +1022,7 @@ VALUES
  '["下单转化率","下单率","加购转化"]',
  '来访客户中提交订单的比例（未必完成支付）',
  'v_traffic_daily','order_buyers / visitors',
- '{"agg":"RATIO","num_expr":"order_buyers","num_agg":"SUM","den_expr":"visitors","den_agg":"SUM","unit":"percent"}',
+ '{"agg":"RATIO","num_expr":"order_buyers","num_agg":"SUM","den_expr":"visitors","den_agg":"SUM","unit":"percent","base_filter":{"stat_scope":"SHOP","source_channel":"TOTAL"}}',
  '["day","week","month"]',
  '{"numerator":"下单买家数","denominator":"访客数","vs_pay_cvr":"与支付转化率并列观察，差值反映「下单未付款」流失"}',
  '下单转化率 = 下单买家数 / 访客数（淘宝官方口径）',
@@ -942,7 +1034,7 @@ VALUES
  '["客单价","平均订单金额","AOV","每客单价"]',
  '平均每个支付买家贡献的支付金额',
  'v_traffic_daily','pay_amount / pay_buyers',
- '{"agg":"RATIO","num_expr":"pay_amount","num_agg":"SUM","den_expr":"pay_buyers","den_agg":"SUM","unit":"currency"}',
+ '{"agg":"RATIO","num_expr":"pay_amount","num_agg":"SUM","den_expr":"pay_buyers","den_agg":"SUM","unit":"currency","base_filter":{"stat_scope":"SHOP","source_channel":"TOTAL"}}',
  '["day","week","month"]',
  '{"numerator":"支付金额","denominator":"支付买家数（不是订单数）","note":"淘宝口径按「买家」而非「订单」计算"}',
  '客单价 = 支付金额 / 支付买家数（淘宝官方口径）',
@@ -1090,8 +1182,10 @@ VALUES
 -- 维度白名单（单一真源）
 DELETE FROM sem_metric_dimension;
 INSERT INTO sem_metric_dimension (metric_id, dimension_name, dim_table, dim_key, enabled) VALUES
+-- ★ M01 不再提供 source_channel 维度（docs/16 P1-9）：
+--   指标只统计 TOTAL（店铺合计），分渠道行不参与；若保留该维度，
+--   TOTAL 会作为伪渠道出现（且每组都相同）。分渠道流量需另建指标。
 ('M01','date','dim_date','date',1),('M01','item_id','dim_item','item_id',1),
-('M01','source_channel',NULL,NULL,1),
 ('M02','date','dim_date','date',1),('M02','item_id','dim_item','item_id',1),
 ('M03','date','dim_date','date',1),('M03','item_id','dim_item','item_id',1),
 ('M04','date','dim_date','date',1),('M04','item_id','dim_item','item_id',1),
@@ -1110,8 +1204,9 @@ INSERT INTO sem_metric_dimension (metric_id, dimension_name, dim_table, dim_key,
 ('M15','date','dim_date','date',1),('M15','channel',NULL,NULL,1),
 ('M15','campaign_id',NULL,NULL,1),('M15','item_id','dim_item','item_id',1),
 ('M16','date','dim_date','date',1),
-('M17','date','dim_date','date',1),('M17','item_id','dim_item','item_id',1),
-('M17','reason_category',NULL,NULL,1),
+-- ★ M17（退款率）是 CROSS_VIEW 口径：分子/分母为全局标量子查询，
+--   与分组维度无关联 —— 按任何维度切片每组都会得到同一个全店值（P0-5），
+--   因此不提供维度白名单；渲染器同时硬拒绝带维度的 CROSS_VIEW 渲染。
 ('M18','date','dim_date','date',1),('M18','item_id','dim_item','item_id',1),
 ('M18','reason_category',NULL,NULL,1);
 

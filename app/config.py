@@ -105,6 +105,9 @@ class Settings:
     llm_model_heavy: str = 'qwen3.8-max'
     llm_context_window: int = 262144
     llm_max_output: int = 16384
+    llm_timeout_seconds: int = 60          # 单次 LLM 调用超时（P1-13）
+    agent_max_duration_seconds: int = 300  # 一次 Agent 循环整体 deadline
+    agent_max_cost_usd: float = 0.10       # 一次 Agent 循环成本上限
 
     # ---------------- 成本熔断 ----------------
     diagnosis_max_cost_usd: float = 0.05
@@ -126,7 +129,7 @@ class Settings:
 
     # ---------------- 认证 ----------------
     jwt_algorithm: str = 'HS256'
-    jwt_access_token_expire_minutes: int = 120
+    jwt_access_token_expire_minutes: int = 15   # 短有效期 + 登出水位（P1-18）
     jwt_refresh_token_expire_days: int = 30
     password_min_length: int = 10
     login_max_attempts: int = 5
@@ -137,11 +140,23 @@ class Settings:
     price_single_cents: int = 19900
     price_pack5_cents: int = 79900
     trial_once_per_user: bool = True
+    # ★ 额度批次化有效期（docs/16 P1-6）：0 = 永久有效
     pack5_valid_days: int = 180
     credit_expire_days: int = 365
     cost_alert_cents: int = 60
     billing_provider: str = 'manual'
     manual_review_required: bool = True
+    # 同一租户 24h 内自动退款上限，超限转人工（防"永远失败"刷退款，P1-7）
+    max_auto_refunds_per_day: int = 10
+
+    # ---------------- 速率限制（docs/16 P1-7） ----------------
+    # 进程内滑动窗口。单 worker 架构下足够；多实例部署需换 Redis。
+    rate_limit_enabled: bool = True
+    rl_register_per_hour: int = 20       # 每 IP（办公 NAT 共享出口留余量）
+    rl_login_per_minute: int = 30        # 每 IP
+    rl_ask_per_minute: int = 30          # 每租户（Agent 成本闸门）
+    rl_upload_per_minute: int = 30       # 每租户
+    rl_diagnosis_per_minute: int = 10    # 每租户
 
     # 注册即赠送的体验次数（获客钩子：让新用户能跑完整个演示流程）
     # 设为 0 可关闭（此时需先购买才能诊断）
@@ -169,6 +184,18 @@ class Settings:
     # ---------------- CORS ----------------
     cors_origins: str = 'http://127.0.0.1:5173'
 
+    # ---------------- 邮箱验证（SMTP，docs/16 P1-7） ----------------
+    web_base_url: str = 'http://127.0.0.1:5173'   # 验证邮件里的前端链接
+    email_verification_required: bool = False
+    email_token_expire_hours: int = 24
+    smtp_host: str = ''
+    smtp_port: int = 465
+    smtp_user: str = ''
+    smtp_password: str = ''
+    smtp_from: str = ''
+    smtp_use_ssl: bool = True                     # true=465 SSL；false=587 STARTTLS
+    smtp_timeout: int = 15
+
     # ------------------------------------------------------------------
     # 构造
     # ------------------------------------------------------------------
@@ -187,6 +214,10 @@ class Settings:
             llm_model_heavy=_get(env, 'LLM_MODEL_HEAVY', 'qwen3.8-max'),
             llm_context_window=_get_int(env, 'LLM_CONTEXT_WINDOW', 262144),
             llm_max_output=_get_int(env, 'LLM_MAX_OUTPUT', 16384),
+            llm_timeout_seconds=_get_int(env, 'LLM_TIMEOUT_SECONDS', 60),
+            agent_max_duration_seconds=_get_int(
+                env, 'AGENT_MAX_DURATION_SECONDS', 300),
+            agent_max_cost_usd=_get_float(env, 'AGENT_MAX_COST_USD', 0.10),
 
             diagnosis_max_cost_usd=_get_float(env, 'DIAGNOSIS_MAX_COST_USD', 0.05),
             tenant_monthly_cost_usd=_get_float(env, 'TENANT_MONTHLY_COST_USD', 5.00),
@@ -204,7 +235,7 @@ class Settings:
 
             jwt_algorithm=_get(env, 'JWT_ALGORITHM', 'HS256'),
             jwt_access_token_expire_minutes=_get_int(
-                env, 'JWT_ACCESS_TOKEN_EXPIRE_MINUTES', 120),
+                env, 'JWT_ACCESS_TOKEN_EXPIRE_MINUTES', 15),
             jwt_refresh_token_expire_days=_get_int(
                 env, 'JWT_REFRESH_TOKEN_EXPIRE_DAYS', 30),
             password_min_length=_get_int(env, 'PASSWORD_MIN_LENGTH', 10),
@@ -220,6 +251,15 @@ class Settings:
             cost_alert_cents=_get_int(env, 'COST_ALERT_CENTS', 60),
             billing_provider=_get(env, 'BILLING_PROVIDER', 'manual'),
             manual_review_required=_get_bool(env, 'MANUAL_REVIEW_REQUIRED', True),
+            max_auto_refunds_per_day=_get_int(
+                env, 'MAX_AUTO_REFUNDS_PER_DAY', 10),
+            rate_limit_enabled=_get_bool(env, 'RATE_LIMIT_ENABLED', True),
+            rl_register_per_hour=_get_int(env, 'RL_REGISTER_PER_HOUR', 20),
+            rl_login_per_minute=_get_int(env, 'RL_LOGIN_PER_MINUTE', 30),
+            rl_ask_per_minute=_get_int(env, 'RL_ASK_PER_MINUTE', 30),
+            rl_upload_per_minute=_get_int(env, 'RL_UPLOAD_PER_MINUTE', 30),
+            rl_diagnosis_per_minute=_get_int(
+                env, 'RL_DIAGNOSIS_PER_MINUTE', 10),
             signup_free_credits=_get_int(env, 'SIGNUP_FREE_CREDITS', 1),
             super_admin_emails=tuple(_get_list(env, 'SUPER_ADMIN_EMAILS')),
             agent_chats_per_credit=_get_int(env, 'AGENT_CHATS_PER_CREDIT', 5),
@@ -234,6 +274,19 @@ class Settings:
             metrics_enabled=_get_bool(env, 'METRICS_ENABLED', True),
 
             cors_origins=_get(env, 'CORS_ORIGINS', 'http://127.0.0.1:5173'),
+
+            web_base_url=_get(env, 'WEB_BASE_URL', 'http://127.0.0.1:5173'),
+            email_verification_required=_get_bool(
+                env, 'REQUIRE_EMAIL_VERIFICATION', False),
+            email_token_expire_hours=_get_int(
+                env, 'EMAIL_TOKEN_EXPIRE_HOURS', 24),
+            smtp_host=_get(env, 'SMTP_HOST', ''),
+            smtp_port=_get_int(env, 'SMTP_PORT', 465),
+            smtp_user=_get(env, 'SMTP_USER', ''),
+            smtp_password=_get(env, 'SMTP_PASSWORD', ''),
+            smtp_from=_get(env, 'SMTP_FROM', ''),
+            smtp_use_ssl=_get_bool(env, 'SMTP_USE_SSL', True),
+            smtp_timeout=_get_int(env, 'SMTP_TIMEOUT', 15),
         )
         s._validate()
         return s
@@ -359,6 +412,21 @@ class Settings:
                 'SANDBOX_NETWORK_ISOLATED 必须为 true —— '
                 '否则客户经营数据可能外发')
 
+        # ★ 要求邮箱验证但 SMTP 未配置 → 用户永远收不到验证邮件，
+        #   也就永远拿不到赠送额度。宁可起不来，也不要带病运行。
+        if self.email_verification_required:
+            missing = []
+            if not self.smtp_host:
+                missing.append('SMTP_HOST')
+            if not self.smtp_from:
+                missing.append('SMTP_FROM')
+            elif '@' not in self.smtp_from:
+                missing.append('SMTP_FROM（格式应形如 no-reply@your-domain.com）')
+            if missing:
+                problems.append(
+                    'REQUIRE_EMAIL_VERIFICATION=true 但 '
+                    + '、'.join(missing) + ' 未配置（无法发送验证邮件）')
+
         return problems
 
     def warnings_for_startup(self) -> list[str]:
@@ -369,6 +437,15 @@ class Settings:
             warns.append(
                 'LLM_API_KEY 未配置 —— 归因对话（形态 B）将降级为提示信息；'
                 '数据上传、诊断报告、查数问答（形态 A）不受影响。')
+
+        if not self.email_verification_required:
+            warns.append(
+                'REQUIRE_EMAIL_VERIFICATION=false —— 注册即发放赠送次数；'
+                '生产环境建议开启邮箱验证并配置 SMTP，避免批量注册刷额度。')
+
+        if (self.smtp_host or self.smtp_user) and not self.smtp_password:
+            warns.append('SMTP 已配置主机/账号但 SMTP_PASSWORD 为空 —— '
+                         '发送验证邮件可能失败。')
 
         return warns
 

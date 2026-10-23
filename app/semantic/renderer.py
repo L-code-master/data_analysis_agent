@@ -76,7 +76,7 @@ class RenderedQuery:
     sql: str
     params: list[Any]
     metric: MetricDefinition
-    time_range: DateRange
+    time_range: DateRange | None
     dimensions: tuple[str, ...]
     columns: tuple[str, ...]
     unit: str = 'count'
@@ -95,7 +95,8 @@ class RenderedQuery:
             'columns': list(self.columns),
             'dimensions': list(self.dimensions),
             'unit': self.unit,
-            'time_range': self.time_range.to_dict(),
+            'time_range': (self.time_range.to_dict()
+                           if self.time_range is not None else None),
             'footnote': self.footnote,
             'warnings': self.warnings,
             'has_compare': bool(self.compare_sql),
@@ -198,6 +199,17 @@ class SQLRenderer:
         for m, sp in targets:
             alias = m.metric_id.lower()
             if sp.get('agg', '').upper() == 'CROSS_VIEW':
+                # ★ 跨视图指标禁止带维度切片（docs/16 P0-5）：
+                #   其分子/分母是「整个时间窗的全局标量子查询」，与分组
+                #   维度没有任何关联 —— 渲染成
+                #   SELECT item_id, <全局值> ... GROUP BY item_id 后
+                #   每组都会拿到同一个全店值，是彻底错误的数字。
+                #   在渲染层硬拒绝（双保险：白名单也已同步移除 M17 维度）。
+                if group_cols:
+                    raise RenderError(
+                        f'指标 {m.metric_id}（{m.metric_name}）为跨视图口径，'
+                        f'不支持按维度 {list(dims)} 切片 —— 每组会得到相同的'
+                        f'全店值。请去掉维度查询总量，或分别查询分子/分母指标')
                 expr, _ = self._expression_cross_view(sp, limit)
                 # 跨视图表达式自带 4 个日期占位符，标记以便 build 补参数
                 cross_view_metrics.append((alias, expr))
@@ -225,6 +237,12 @@ class SQLRenderer:
                 phys_k = DIMENSION_COLUMN_MAP.get(k, k)
                 filter_conds.append((f'{phys_k} = ?', [v]))
 
+        # ---- 5b. 指标自带的固定口径过滤（docs/16 P1-9）----
+        #   例：流量指标只取 stat_scope='SHOP' AND source_channel='TOTAL'，
+        #   否则「合计行 + 分渠道行 / 店铺级 + 商品级」会被 SUM 重复计数。
+        #   过滤字段只允许已知维度列，值一律参数化（不拼接用户输入）。
+        base_conds = self._base_filter_conds(targets)
+
         def build(rng: DateRange | None) -> tuple[str, list[Any]]:
             """按给定日期区间生成 SQL 与参数。
 
@@ -245,7 +263,11 @@ class SQLRenderer:
                     ps.extend([rng_s, rng_e, rng_s, rng_e])
 
             frags: list[str] = []
-            # 2) 过滤条件
+            # 2a) 指标口径过滤（固定条件，先于用户过滤）
+            for frag, fparams in base_conds:
+                frags.append(frag)
+                ps.extend(fparams)
+            # 2b) 用户过滤条件
             for frag, fparams in filter_conds:
                 frags.append(frag)
                 ps.extend(fparams)
@@ -280,7 +302,7 @@ class SQLRenderer:
             sql=sql,
             params=params,
             metric=metric,
-            time_range=time_range or DateRange.__new__(DateRange),
+            time_range=time_range,       # None = 不限制时间（P2-7）
             dimensions=dims,
             columns=tuple(columns),
             unit=spec.get('unit', 'count'),
@@ -294,11 +316,50 @@ class SQLRenderer:
     # ------------------------------------------------------------------
     # 内部
     # ------------------------------------------------------------------
+    def _base_filter_conds(self, targets: list[tuple[MetricDefinition, dict]]
+                           ) -> list[tuple[str, list[Any]]]:
+        """把 metric_spec.base_filter（等值过滤）转成 SQL 片段。
+
+        同一次查询的多个指标必须口径一致，否则拒绝 —— 否则一个 WHERE
+        无法同时满足两种基础过滤，静默取其一就是错数字。
+        """
+        conds: list[tuple[str, list[Any]]] = []
+        signature: str | None = None
+        for m, sp in targets:
+            bf = sp.get('base_filter')
+            if not bf:
+                continue
+            if not isinstance(bf, dict):
+                raise RenderError(
+                    f'指标 {m.metric_id} 的 base_filter 必须是对象')
+            parts: list[tuple[str, list[Any]]] = []
+            for k, v in sorted(bf.items()):
+                _require_ident(k)
+                if k not in DIMENSION_COLUMN_MAP and k not in FILTERABLE_EXTRA:
+                    raise RenderError(
+                        f'指标 {m.metric_id} 的 base_filter 含未知列 {k!r}')
+                if not isinstance(v, (str, int, float, bool)):
+                    raise RenderError(
+                        f'指标 {m.metric_id} 的 base_filter 值必须是标量')
+                parts.append((f'{DIMENSION_COLUMN_MAP.get(k, k)} = ?', [v]))
+            sig = json.dumps(sorted(bf.items()), ensure_ascii=False, default=str)
+            if signature is None:
+                signature = sig
+                conds = parts
+            elif sig != signature:
+                raise RenderError(
+                    f'同一次查询的指标口径过滤不一致（{m.metric_id}）—— '
+                    f'请分开查询这些指标')
+        return conds
+
     def _parse_spec(self, metric: MetricDefinition) -> dict:
         """解析 metric_spec（机器可执行规格）。"""
-        raw = getattr(metric, '_metric_spec_raw', None)
+        # ★ 优先用加载时缓存的规格（docs/16 P1-16）：registry 可能在
+        #   原连接关闭后仍被复用（chat Agent 工具调用），此时不能再回查 DB。
+        raw = getattr(metric, 'metric_spec_raw', '') or None
         if raw is None:
-            # MetricDefinition 未暴露该字段时，从 registry 直接取
+            raw = getattr(metric, '_metric_spec_raw', None)
+        if raw is None:
             raw = self._reg.metric_spec(metric.metric_id)
         if not raw:
             raise RenderError(

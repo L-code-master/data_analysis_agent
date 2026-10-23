@@ -91,7 +91,7 @@ check('消息历史空', r.status_code == 200 and r.json() == [])
 
 def ask(q: str):
     r = client.post(f'/api/v1/chat/sessions/{SID}/ask', headers=H,
-                    params={'question': q})
+                    json={'question': q})
     return r.status_code, (r.json() if r.status_code == 200 else {})
 
 # ---------------------------------------------------------------------------
@@ -227,7 +227,7 @@ check('已用 = 5', r.json()['agent_quota']['used'] == 5,
 msgs_before = len(client.get(f'/api/v1/chat/sessions/{SID}/messages',
                              headers=H).json())
 r = client.post(f'/api/v1/chat/sessions/{SID}/ask', headers=H,
-                params={'question': '为什么转化率跌了？帮我分析'})
+                json={'question': '为什么转化率跌了？帮我分析'})
 check('★ 配额用尽 → 402', r.status_code == 402, r.status_code)
 check('错误码 AGENT_QUOTA_EXCEEDED',
       r.json().get('code') == 'AGENT_QUOTA_EXCEEDED')
@@ -240,9 +240,12 @@ st, a = ask('支付金额多少')
 check('★ 配额用尽后查数（A）仍正常', st == 200 and a.get('route') == 'qa')
 
 # 购买增加配额（pack5 = +5 次诊断 → 配额 30）
+# ★ 核销走服务层 mark_paid：API 的 confirm 现在仅平台管理员可调
+#   （docs/16 P0-1），本模块测的是配额记账而非核销权限
+from app.services import billing as _billing_svc          # noqa: E402
 o = client.post('/api/v1/billing/orders', headers=H,
                 json={'sku': 'pack5'}).json()
-client.post(f"/api/v1/billing/orders/{o['order_no']}/confirm", headers=H)
+_billing_svc.mark_paid(o['order_no'], reviewed_by='test')
 r = client.get('/api/v1/chat/context', headers=H)
 check('★ 购买后配额 = 30（(5购买+1赠送)×5）',
       r.json()['agent_quota']['quota'] == 30, r.json()['agent_quota'])
@@ -251,10 +254,32 @@ check('★ 购买后配额 = 30（(5购买+1赠送)×5）',
 with _db.transaction() as _conn:
     _conn.execute("UPDATE users SET role='admin' WHERE email='qa@test.com'")
 r = client.post(f'/api/v1/chat/sessions/{SID}/ask', headers=H,
-                params={'question': '为什么转化率跌了？帮我分析'})
+                json={'question': '为什么转化率跌了？帮我分析'})
 check('★ admin 不受配额限制（200，走 no_llm 因无 key）',
       r.status_code == 200 and r.json().get('route') == 'no_llm',
       f'{r.status_code}/{r.json().get("route") if r.status_code == 200 else r.text[:60]}')
+
+# ---------------------------------------------------------------------------
+print('\n[9] 成本熔断错误映射（docs/16 P1-7）')
+from unittest.mock import patch                              # noqa: E402
+from app.services import chat as _chat_svc                   # noqa: E402
+with patch.object(_chat_svc, 'ask',
+                  side_effect=_chat_svc.CostQuotaExceededError(
+                      '本月算力额度已用完（6.00/5.00 USD）')):
+    r = client.post(f'/api/v1/chat/sessions/{SID}/ask', headers=H,
+                    json={'question': '为什么转化率跌了？帮我分析'})
+check('★ 成本熔断 → 402', r.status_code == 402, r.status_code)
+check('错误码 COST_QUOTA_EXCEEDED',
+      r.json().get('code') == 'COST_QUOTA_EXCEEDED', r.text[:80])
+
+# ---------------------------------------------------------------------------
+print('\n[10] 提问走 JSON body 且限长（docs/16 P2-18）')
+r = client.post(f'/api/v1/chat/sessions/{SID}/ask', headers=H,
+                json={'question': 'x' * 2001})
+check('★ 超长问题 422', r.status_code == 422, r.status_code)
+r = client.post(f'/api/v1/chat/sessions/{SID}/ask', headers=H,
+                params={'question': '毛利率多少'})
+check('★ 旧 query 方式不再接受（422）', r.status_code == 422, r.status_code)
 
 print()
 print('=' * 78)

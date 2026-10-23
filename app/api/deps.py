@@ -11,7 +11,8 @@ from typing import Annotated
 
 from fastapi import Depends, Header, HTTPException, Request, status
 
-from app.services import auth, billing
+from app.config import get_settings
+from app.services import auth, billing, ratelimit
 from app.services.auth import AuthError, AuthUser
 
 
@@ -25,6 +26,25 @@ def _client_ip(request: Request) -> str:
 
 def _user_agent(request: Request) -> str:
     return request.headers.get('user-agent', '')[:200]
+
+
+def enforce_rate_limit(scope: str, key: str, limit: int,
+                       window_seconds: int) -> None:
+    """路由层限速入口：超限 → 429（docs/16 P1-7）。
+
+    限速开关与各端点阈值来自 Settings（RATE_LIMIT_ENABLED / RL_*）。
+    """
+    if not get_settings().rate_limit_enabled:
+        return
+    try:
+        ratelimit.enforce(scope, key, limit, window_seconds)
+    except ratelimit.RateLimitExceeded as e:
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail={'code': 'RATE_LIMITED', 'message': str(e),
+                    'retry_after': e.retry_after},
+            headers={'Retry-After': str(e.retry_after)},
+        ) from e
 
 
 async def get_current_user(
@@ -58,6 +78,13 @@ async def get_current_user(
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail='登录凭证已失效，请重新登录')
+
+    # ★ 登出/改密水位（docs/16 P1-18）：无状态 access token 也要能撤销
+    if auth.access_token_revoked(payload, user):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail='登录凭证已失效，请重新登录',
+            headers={'WWW-Authenticate': 'Bearer'})
 
     return user
 

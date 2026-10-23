@@ -82,9 +82,17 @@ def transaction() -> Iterator[sqlite3.Connection]:
 
     注意：连接使用 isolation_level=None（自动提交），
     因此这里显式 BEGIN / COMMIT。
+
+    ★ 必须用 BEGIN IMMEDIATE（docs/16 P1-5）：
+      默认的 BEGIN（deferred）在「先 SELECT 后 UPDATE」的事务里
+      会等到写语句才升级锁；WAL 下若期间已有别的连接提交写事务，
+      升级会直接抛 SQLITE_BUSY_SNAPSHOT（busy_timeout 对快照冲突无效）。
+      mark_paid / cancel_order / rotate_refresh_token 都属于这种模式。
+      IMMEDIATE 在事务开始时就取得写锁，把冲突挡在 BEGIN 处并由
+      busy_timeout 正常等待。
     """
     conn = get_conn()
-    conn.execute('BEGIN')
+    conn.execute('BEGIN IMMEDIATE')
     try:
         yield conn
     except Exception:
@@ -125,6 +133,11 @@ def apply_schema(schema_file: Path | None = None) -> None:
     # 旧库迁移：schema.sql 只对新库生效，这里给已有表补列
     migrations = (
         "ALTER TABLE sources ADD COLUMN sheet_name TEXT DEFAULT ''",
+        # docs/16 P1-6：额度批次化后，流水要能回指批次（退款回原批次）
+        "ALTER TABLE credit_ledger ADD COLUMN lot_id TEXT",
+        # docs/16 P1-18：access token 撤销水位 / refresh token 轮换族
+        "ALTER TABLE users ADD COLUMN token_valid_after TEXT",
+        "ALTER TABLE refresh_tokens ADD COLUMN family_id TEXT",
     )
     for stmt in migrations:
         try:

@@ -13,6 +13,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import time
 from dataclasses import dataclass, field
 
@@ -25,6 +26,8 @@ __all__ = ['AgentEngine', 'AgentTurnResult', 'LoopGuard', 'build_tools']
 
 MAX_TURNS = 8                       # 循环步数上限（防失控）
 CONTEXT_BUDGET_TOKENS = 60_000      # 触发压缩的消息区预算（保守值）
+
+logger = logging.getLogger(__name__)
 
 
 class LoopGuard:
@@ -155,13 +158,16 @@ def build_tools(reg, con_getter) -> tuple[list[dict], dict]:
 
     def _compute_metric(args: dict) -> str:
         from app.semantic.registry import SemanticRegistry
-        from app.services.diagnosis import _apply_semantic_upgrades
-        con = con_getter()
+        from app.semantic.renderer import SQLRenderer
+        con = con_getter()            # _open_semantic_db 已按版本迁移
         try:
-            _apply_semantic_upgrades(con)
-            r2 = SemanticRegistry(con)
-            r2.load()
-            from app.semantic.renderer import SQLRenderer
+            # ★ 复用 ask 作用域加载好的 registry（docs/16 P1-16）：
+            #   指标定义与 metric_spec 都在内存里，不再每次工具调用重建。
+            #   仅在未传入 registry 时（单测/独立工具）回退到现建。
+            r2 = reg
+            if r2 is None:
+                r2 = SemanticRegistry(con)
+                r2.load()
             rq = SQLRenderer(r2).render(metric_id=args['metric_id'],
                                         time_range=_tr(args.get('time_range')))
             row = con.execute(rq.sql, rq.params).fetchone()
@@ -245,13 +251,20 @@ class AgentEngine:
 
     def __init__(self, client: LlmClient, tenant_id: str,
                  tools_spec: list[dict], tools_impl: dict,
-                 max_turns: int = MAX_TURNS):
+                 max_turns: int = MAX_TURNS,
+                 max_cost_usd: float | None = None,
+                 deadline_seconds: float | None = None):
         self.client = client
         self.tenant_id = tenant_id
         self.tools_spec = tools_spec
         self.tools_impl = tools_impl
         self.max_turns = max_turns
         s = get_settings()
+        self.max_cost_usd = (s.agent_max_cost_usd
+                             if max_cost_usd is None else max_cost_usd)
+        self.deadline_seconds = (s.agent_max_duration_seconds
+                                 if deadline_seconds is None
+                                 else deadline_seconds)
         self.compressor = Compressor(
             estimator=TokenEstimator(),
             summarizer=None,                 # L3 摘要需注入 LLM，二期接
@@ -279,9 +292,29 @@ class AgentEngine:
         messages += (history or [])[-20:]          # 最近 20 条历史
         messages.append({'role': 'user', 'content': question})
 
+        # ★ 整体 deadline（docs/16 P1-13）：单轮超时不够，
+        #   最坏 8 轮 × 重试仍可能拖很久。
+        deadline = (time.monotonic() + self.deadline_seconds
+                    if self.deadline_seconds and self.deadline_seconds > 0
+                    else None)
+
+        def budget_error() -> str:
+            if deadline is not None and time.monotonic() > deadline:
+                return f'分析超时（超过 {self.deadline_seconds:.0f} 秒）'
+            if self.max_cost_usd and self.max_cost_usd > 0 \
+                    and res.cost_usd >= self.max_cost_usd:
+                return (f'分析成本超过上限'
+                        f'（{res.cost_usd:.4f}/{self.max_cost_usd:.4f} USD）')
+            return ''
+
         try:
             for turn in range(self.max_turns):
                 res.turns = turn + 1
+                exceeded = budget_error()
+                if exceeded:
+                    res.error = exceeded
+                    res.guard_warnings = guard.warnings
+                    return res
 
                 # 上下文预算检查 → 压缩（v1.3 库的第二个用户）
                 if self.compressor.should_compress(messages):
@@ -298,6 +331,13 @@ class AgentEngine:
 
                 if not resp.wants_tool:
                     res.answer = resp.content or '（模型未返回内容）'
+                    res.guard_warnings = guard.warnings
+                    return res
+
+                # 还要继续调工具 → 先确认预算，避免再烧一轮
+                exceeded = budget_error()
+                if exceeded:
+                    res.error = exceeded
                     res.guard_warnings = guard.warnings
                     return res
 
@@ -329,7 +369,12 @@ class AgentEngine:
                                      'tool_call_id': call['id'],
                                      'content': result_text[:4000]})
 
-            # 步数耗尽 → 强制收口
+            # 步数耗尽 → 强制收口（先确认预算，超限不再发起新调用）
+            exceeded = budget_error()
+            if exceeded:
+                res.error = exceeded
+                res.guard_warnings = guard.warnings
+                return res
             messages.append({'role': 'user', 'content':
                              '（步数已达上限，请基于已获得的信息直接回答，'
                              '不要再调用工具）'})
@@ -366,15 +411,22 @@ class AgentEngine:
         res.input_tokens += resp.input_tokens
         res.output_tokens += resp.output_tokens
         res.reasoning_tokens += resp.reasoning_tokens
-        res.cost_usd = round(_estimate_cost(res.input_tokens,
-                                            res.output_tokens), 6)
+
+        # ★ 单次调用成本（docs/16 P1-1）：usage_records 每行必须存**本次**
+        #   用量，不能把累计值当单次值入账 —— 否则 3 次各 $0.01 会记成
+        #   $0.01 + $0.02 + $0.03 = $0.06，轮数越多放大越严重，成本熔断
+        #   被虚增值提前触发，付费用户被错误 402。
+        call_cost = round(_estimate_cost(resp.input_tokens, resp.output_tokens), 6)
+        res.cost_usd = round(res.cost_usd + call_cost, 6)
         try:
-            billing.record_cost(self.tenant_id, res.cost_usd, model=self.model,
+            billing.record_cost(self.tenant_id, call_cost, model=self.model,
                                 input_tokens=resp.input_tokens,
                                 output_tokens=resp.output_tokens,
                                 reasoning_tokens=resp.reasoning_tokens)
         except Exception:                           # noqa: BLE001
-            pass                                    # 记账失败不阻断对话
+            # 记账失败不阻断对话，但绝不能静默：成本漏记会让熔断统计失真
+            logger.exception('LLM 成本记账失败 tenant=%s model=%s cost=%.6f',
+                             self.tenant_id, self.model, call_cost)
 
 
 def _estimate_cost(input_tokens: int, output_tokens: int) -> float:

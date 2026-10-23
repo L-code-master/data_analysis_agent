@@ -11,8 +11,16 @@ export default function RegisterPage() {
 
   const onFinish = async (v: { email: string; password: string; tenant_name: string }) => {
     try {
-      await register(v.email, v.password, v.tenant_name)
-      message.success('注册成功，已自动登录')
+      const res = await register(v.email, v.password, v.tenant_name)
+      if (res.verification_required && !res.user.email_verified) {
+        if (res.verification_sent) {
+          message.success('注册成功，验证邮件已发送，请查收（验证后赠送次数到账）')
+        } else {
+          message.warning('注册成功，但验证邮件发送失败，请在「设置」页重新发送')
+        }
+      } else {
+        message.success('注册成功，已自动登录')
+      }
       navigate('/dashboard', { replace: true })
     } catch (e) {
       message.error(errMsg(e))

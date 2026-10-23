@@ -6,6 +6,7 @@ export interface UserInfo {
   email: string
   role: string
   display_name: string
+  email_verified?: boolean
 }
 
 export interface TokenInfo {
@@ -18,6 +19,8 @@ export interface TokenInfo {
 export interface AuthResponse {
   user: UserInfo
   token: TokenInfo
+  verification_required?: boolean
+  verification_sent?: boolean
 }
 
 export interface SourceInfo {
@@ -159,6 +162,7 @@ export interface AccountInfo {
   total_used: number
   trial_available: boolean
   cost_used_usd: number
+  next_expiry_at?: string
   prices: Record<string, number>
 }
 
@@ -191,6 +195,7 @@ export interface LedgerEntry {
   reason: string
   note: string
   created_at: string
+  expires_at?: string
 }
 
 /** SSE 进度事件 */

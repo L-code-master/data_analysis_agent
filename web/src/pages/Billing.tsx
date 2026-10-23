@@ -113,6 +113,9 @@ export default function BillingPage() {
             <Typography.Text type="secondary">
               累计购买 {account?.total_purchased ?? 0} 次 ·
               已使用 {account?.total_used ?? 0} 次
+              {account?.next_expiry_at && (
+                <> · 最近到期 {dayjs(account.next_expiry_at).format('YYYY-MM-DD')}</>
+              )}
             </Typography.Text>
           </Col>
           <Col>
@@ -239,6 +242,10 @@ export default function BillingPage() {
               render: (v: string) => <Tag>{REASON_LABEL[v] ?? v}</Tag>,
             },
             { title: '说明', dataIndex: 'note', ellipsis: true },
+            {
+              title: '到期', dataIndex: 'expires_at', width: 110,
+              render: (v: string) => (v ? dayjs(v).format('YYYY-MM-DD') : '—'),
+            },
             {
               title: '时间', dataIndex: 'created_at', width: 160,
               render: (v: string) => (v ? dayjs(v).format('MM-DD HH:mm') : '—'),

@@ -4,6 +4,7 @@ import { AuthProvider, useAuth } from './stores/auth'
 import AppLayout from './components/AppLayout'
 import LoginPage from './pages/Login'
 import RegisterPage from './pages/Register'
+import VerifyEmailPage from './pages/VerifyEmail'
 import DashboardPage from './pages/Dashboard'
 import UploadPage from './pages/Upload'
 import MappingPage from './pages/Mapping'
@@ -35,6 +36,7 @@ function AppRoutes() {
     <Routes>
       <Route path="/login" element={<LoginPage />} />
       <Route path="/register" element={<RegisterPage />} />
+      <Route path="/verify-email" element={<VerifyEmailPage />} />
 
       <Route
         path="/"

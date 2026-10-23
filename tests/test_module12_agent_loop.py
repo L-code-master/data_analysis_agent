@@ -78,7 +78,7 @@ FAKE_IMPL = {
 }
 
 
-def new_engine(script, impl=None, max_turns=8):
+def new_engine(script, impl=None, max_turns=8, **kw):
     return AgentEngine(
         client=FakeLlmClient(script),
         tenant_id=TENANT,
@@ -86,6 +86,7 @@ def new_engine(script, impl=None, max_turns=8):
                                                       'parameters': {}}}],
         tools_impl=impl or FAKE_IMPL,
         max_turns=max_turns,
+        **kw,
     )
 
 
@@ -117,6 +118,23 @@ check('★ 成本记账（usage_records）',
       billing.usage_summary(TENANT)['calls'] >= 1,
       billing.usage_summary(TENANT))
 check('成本估算非零', res.cost_usd > 0, res.cost_usd)
+
+# ★ P1-1：每行必须存单次成本，而不是累计值
+with _db.get_conn() as c:
+    cost_rows = c.execute(
+        "SELECT input_tokens,output_tokens,cost_usd FROM usage_records "
+        "WHERE tenant_id=? ORDER BY created_at", (TENANT,)).fetchall()
+per_call = round(100 / 1_000_000 * 0.11 + 50 / 1_000_000 * 0.55, 6)
+third_call = round(80 / 1_000_000 * 0.11 + 40 / 1_000_000 * 0.55, 6)
+expected = [per_call, per_call, third_call]
+sum_cost = sum(r[2] for r in cost_rows)
+check('★ 3 次调用记 3 行 usage', len(cost_rows) == 3, len(cost_rows))
+check('★ 每行存单次成本（不是累计值）',
+      all(abs(r[2] - e) < 1e-9 for r, e in zip(cost_rows, expected)),
+      [round(r[2], 8) for r in cost_rows])
+check('★ usage 合计 = 引擎返回成本',
+      abs(sum_cost - res.cost_usd) < 1e-9,
+      f'{sum_cost:.8f} vs {res.cost_usd:.8f}')
 
 # 消息结构校验（发给 LLM 的第 2 轮应含 tool 消息）
 fake: FakeLlmClient = eng.client
@@ -245,6 +263,32 @@ eng4 = new_engine([LlmResponse(content='ok', input_tokens=5, output_tokens=5)])
 eng4.run('无上下文')
 check('不传 data_context 时 prompt 不变',
       '当前数据上下文' not in eng4.client.calls[0]['messages'][0]['content'])
+
+# ---------------------------------------------------------------------------
+print('\n[10] 预算护栏（docs/16 P1-13）')
+from unittest.mock import patch                          # noqa: E402
+eng_deadline = new_engine(
+    [LlmResponse(content='不该被调用', input_tokens=1, output_tokens=1)],
+    deadline_seconds=1)
+# 第一次取 now 用于计算 deadline，第二次检查时已过 1000 秒
+with patch('app.services.agent_engine.time.monotonic',
+           side_effect=[1000.0, 2000.0]):
+    res_deadline = eng_deadline.run('超时测试')
+check('★ deadline 立即终止', bool(res_deadline.error)
+      and '超时' in res_deadline.error, res_deadline.error)
+check('超时后不再调用 LLM', len(eng_deadline.client.calls) == 0,
+      len(eng_deadline.client.calls))
+
+eng_cost = new_engine(
+    [resp_tools(call('b1', 'list_metrics')),
+     resp_tools(call('b2', 'list_metrics')),
+     LlmResponse(content='不该继续', input_tokens=1, output_tokens=1)],
+    max_cost_usd=0.000001)
+res_cost = eng_cost.run('成本测试')
+check('★ 成本超过上限终止',
+      '成本超过上限' in (res_cost.error or ''), res_cost.error)
+check('成本终止前只调用 1 次 LLM',
+      len(eng_cost.client.calls) == 1, len(eng_cost.client.calls))
 
 print()
 print('=' * 78)

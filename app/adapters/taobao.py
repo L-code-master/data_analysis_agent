@@ -51,6 +51,11 @@ class SniffResult:
         return (top - second) < 0.15
 
 
+# 单表读取行数上限（docs/16 P1-11）。
+# 触顶时**必须**产生 warning 并要求人工确认 —— 不能静默截断。
+MAX_READ_ROWS = 200_000
+
+
 @dataclass
 class ReadResult:
     """文件读取结果。"""
@@ -60,6 +65,7 @@ class ReadResult:
     header_row_index: int = 0
     encoding: str = 'utf-8'
     warnings: list[str] = field(default_factory=list)
+    truncated: bool = False        # 是否因行数上限被截断
 
     @property
     def row_count(self) -> int:
@@ -150,18 +156,21 @@ def read_file(path: Path, spec: SourceSpec | None = None,
     suffix = path.suffix.lower()
     warnings: list[str] = []
 
+    truncated = False
     if suffix in ('.xlsx', '.xlsm'):
-        headers, rows, sheet, hdr_idx = _read_excel(path, spec, sheet_name)
+        headers, rows, sheet, hdr_idx, truncated = _read_excel(
+            path, spec, sheet_name)
         encoding = ''
     elif suffix == '.xls':
-        headers, rows, sheet, hdr_idx = _read_excel(path, spec, sheet_name)
+        headers, rows, sheet, hdr_idx, truncated = _read_excel(
+            path, spec, sheet_name)
         encoding = ''
         warnings.append('.xls 为旧格式，建议另存为 .xlsx 以获得更好的兼容性')
     elif suffix == '.csv':
         if sheet_name:
             raise ValueError('CSV 文件不支持指定工作表')
         encoding = detect_encoding(path)
-        headers, rows, hdr_idx = _read_csv(path, encoding, spec)
+        headers, rows, hdr_idx, truncated = _read_csv(path, encoding, spec)
         sheet = ''
         if encoding not in ('utf-8', 'utf-8-sig'):
             warnings.append(f'检测到编码 {encoding}，已按此解码')
@@ -169,6 +178,12 @@ def read_file(path: Path, spec: SourceSpec | None = None,
         raise ValueError(
             f'不支持的文件类型: {suffix}。'
             f'支持 .xlsx / .xls / .csv')
+
+    if truncated:
+        warnings.append(
+            f'文件行数超过 {MAX_READ_ROWS:,} 行上限，仅读取前 '
+            f'{MAX_READ_ROWS:,} 行 —— 报告将基于截断后的数据，'
+            f'请拆分文件或导出更短周期后再诊断')
 
     # 清理列名空白
     headers = [str(h).strip() if h is not None else '' for h in headers]
@@ -180,6 +195,7 @@ def read_file(path: Path, spec: SourceSpec | None = None,
         header_row_index=hdr_idx,
         encoding=encoding,
         warnings=warnings,
+        truncated=truncated,
     )
 
 
@@ -276,19 +292,21 @@ def _read_excel(path: Path, spec: SourceSpec | None,
 
     ws = wb[sheet_name]
     raw: list[list[Any]] = []
+    truncated = False
     for row in ws.iter_rows(values_only=True):
-        raw.append(list(row))
-        if len(raw) > 200_000:      # 安全上限
+        if len(raw) >= MAX_READ_ROWS:
+            truncated = True        # 还有下一行没读 → 确属截断
             break
+        raw.append(list(row))
     wb.close()
 
     if not raw:
-        return [], [], sheet_name, 0
+        return [], [], sheet_name, 0, truncated
 
     hdr = _pick_header_row(raw, spec.header_row_candidates if spec else (0,), spec)
     headers = raw[hdr]
     body = [r for r in raw[hdr + 1:] if any(c is not None and str(c).strip() for c in r)]
-    return headers, body, sheet_name, hdr
+    return headers, body, sheet_name, hdr, truncated
 
 
 def _read_csv(path: Path, encoding: str, spec: SourceSpec | None):
@@ -303,19 +321,21 @@ def _read_csv(path: Path, encoding: str, spec: SourceSpec | None):
 
     reader = csv.reader(io.StringIO(text), delimiter=delim)
     raw = []
+    truncated = False
     for row in reader:
-        raw.append(row)
-        if len(raw) > 200_000:
+        if len(raw) >= MAX_READ_ROWS:
+            truncated = True
             break
+        raw.append(row)
 
     if not raw:
-        return [], [], 0
+        return [], [], 0, truncated
 
     hdr = _pick_header_row(raw, spec.header_row_candidates if spec else (0,), spec)
     headers = raw[hdr]
     body = [r for r in raw[hdr + 1:]
             if any(c is not None and str(c).strip() for c in r)]
-    return headers, body, hdr
+    return headers, body, hdr, truncated
 
 
 # ---------------------------------------------------------------------------
@@ -549,25 +569,53 @@ def field_type_of(table: str, field: str) -> str:
     return FIELD_TYPES.get(table, {}).get(field, 'text')
 
 
-def coerce_for_table(table: str, field: str, value: Any) -> Any:
-    """按目标表的字段类型做转换（类型驱动，不靠名字猜）。"""
-    return _coerce_typed(field_type_of(table, field), value)
+_BLANK_TOKENS = ('-', '--', '—', '/', 'NULL', 'null', 'None')
+
+
+def _is_blank(value: Any) -> bool:
+    """空值判定（与 _coerce_typed 的口径一致）。"""
+    if value is None:
+        return True
+    s = str(value).strip()
+    return s == '' or s in _BLANK_TOKENS
+
+
+def coerce_for_table(table: str, field: str, value: Any,
+                     bad_values: dict[str, dict] | None = None) -> Any:
+    """按目标表的字段类型做转换（类型驱动，不靠名字猜）。
+
+    Args:
+        bad_values: 可选收集器。数值字段解析失败时（非空值 → NULL），
+            累计 `{field: {'count': n, 'samples': [...]}}`，供导入层
+            写入 dwd_etl_errors(BAD_AMOUNT) —— 不静默（docs/16 P1-10）。
+    """
+    kind = field_type_of(table, field)
+    out = _coerce_typed(kind, value)
+    if (out is None and kind in ('float', 'int')
+            and bad_values is not None and not _is_blank(value)):
+        s = str(value).strip()
+        item = bad_values.setdefault(field, {'count': 0, 'samples': []})
+        item['count'] += 1
+        if len(item['samples']) < 3 and s not in item['samples']:
+            item['samples'].append(s[:60])
+    return out
 
 
 def _coerce_typed(kind: str, value: Any) -> Any:
     """按声明的类型做归一化。"""
-    if value is None:
+    if _is_blank(value):
         return None
     s = str(value).strip()
-    if s == '' or s in ('-', '--', '—', '/', 'NULL', 'null', 'None'):
-        return None
 
     if kind in ('date', 'datetime'):
         return _normalize_datetime(s)
     if kind in ('float', 'int'):
         v = _normalize_number(s)
-        if isinstance(v, str):          # 解析失败 → 保留原文（可追溯）
-            return None if kind == 'float' else None
+        if isinstance(v, str):
+            # 解析失败 → NULL（原文由调用方收集到 BAD_AMOUNT 错误表）。
+            # 早期版本这里写成 `None if kind == 'float' else None` 的死三元，
+            # 注释却声称"保留原文（可追溯）"，两者都是错的（docs/16 P1-10）。
+            return None
         if kind == 'int' and isinstance(v, float):
             return int(round(v))
         return v
@@ -724,6 +772,9 @@ class PreparedSource:
             return True
         if self.sniff.needs_user_choice:
             return True
+        # 截断必须让人看见（docs/16 P1-11），否则用户以为报告覆盖了全量数据
+        if self.read.truncated:
+            return True
         return bool(self.missing_required or self.low_confidence)
 
 
@@ -813,10 +864,12 @@ def prepare_all(path: Path) -> list[PreparedSource]:
     try:
         for name in wb.sheetnames:
             raw: list[list[Any]] = []
+            truncated = False
             for row in wb[name].iter_rows(values_only=True):
-                raw.append(list(row))
-                if len(raw) > 200_000:
+                if len(raw) >= MAX_READ_ROWS:
+                    truncated = True
                     break
+                raw.append(list(row))
             if not raw:
                 continue
 
@@ -839,7 +892,10 @@ def prepare_all(path: Path) -> list[PreparedSource]:
             read = ReadResult(
                 headers=headers2, rows=body, sheet_name=name,
                 header_row_index=hdr2, encoding='',
-                warnings=[],
+                warnings=([f'工作表「{name}」超过 {MAX_READ_ROWS:,} 行上限，'
+                           f'仅读取前 {MAX_READ_ROWS:,} 行（存在截断）']
+                          if truncated else []),
+                truncated=truncated,
             )
             results.append(_prepared_from_read(path, read, sn, sha))
     finally:

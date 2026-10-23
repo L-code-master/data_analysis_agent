@@ -16,7 +16,7 @@ XLSX_MEDIA = 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
 
 
 @router.get('', summary='样例数据简介')
-async def sample_info():
+def sample_info():
     """样例数据的故事与结构（用于前端展示）。"""
     info = sample_data.story_summary()
     return {
@@ -32,10 +32,11 @@ async def sample_info():
 
 
 @router.get('/download', summary='下载样例数据 Excel')
-async def download_sample():
+def download_sample():
     """下载样例数据（一个 Excel，7 个工作表：说明 + 6 张报表）。
 
     上传此文件时会被自动拆分为 6 个数据源（说明页自动跳过）。
+    同步 def：整个 Excel 在内存中生成（百毫秒级），放线程池不占事件循环。
     """
     content = sample_data.build_xlsx()
     return Response(

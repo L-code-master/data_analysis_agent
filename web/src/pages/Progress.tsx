@@ -19,6 +19,7 @@ export default function ProgressPage() {
   const [current, setCurrent] = useState<string>('')
   const [error, setError] = useState('')
   const [done, setDone] = useState(false)
+  const [connError, setConnError] = useState('')
   const closedRef = useRef(false)
 
   useEffect(() => {
@@ -50,7 +51,10 @@ export default function ProgressPage() {
           close()
         }
       },
-      () => { /* EventSource 自动重连，忽略瞬时错误 */ },
+      // 连接层错误（区别于诊断本身的失败）：
+      // 致命（404/403 等）直接提示；瞬时中断已在 client 内重试 3 次，
+      // 仍失败则提示手动刷新 —— 后端会回放历史事件，刷新不会丢进度。
+      (e) => { setConnError(e.message) },
     )
 
     return () => { close() }
@@ -112,6 +116,15 @@ export default function ProgressPage() {
   return (
     <div className="page-narrow">
       <Card variant="borderless" title="正在诊断…">
+        {connError && (
+          <Alert
+            type="warning"
+            showIcon
+            style={{ marginBottom: 16 }}
+            message={connError}
+            description={'诊断仍在后台进行。点击下方「刷新状态」可重新连接并回放进度。'}
+          />
+        )}
         <div style={{ textAlign: 'center', padding: '12px 0 20px' }}>
           <Spin indicator={<LoadingOutlined style={{ fontSize: 32 }} spin />} />
           <div style={{ marginTop: 12 }}>

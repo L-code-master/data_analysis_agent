@@ -9,6 +9,8 @@ import sys
 import pathlib
 import tempfile
 import time
+import uuid
+import datetime as dt
 
 sys.stdout.reconfigure(encoding='utf-8', errors='replace')
 ROOT = pathlib.Path(__file__).resolve().parents[1]
@@ -89,21 +91,33 @@ orders = _csv_bytes(
      '商家编码', 'SKU ID', 'sku属性', '单价', '购买数量', '买家实际支付金额',
      '商品金额', '运费', '优惠金额', '商家实收金额', '收货省份'])
 
+# ★ 采购成本批次：缺少它会被 QC-06b（P1-8）拦截，诊断失败并退款
+purchase = _csv_bytes(
+    [['B1', 'MC-A', 'ITEM-A', '2026-09-01', '2026-09-10', '100',
+      '80.00', '400.00', '0.00', '甲', 'CNY']],
+    ['批次号', '商家编码', '商品ID', '采购日期', '到仓日期', '数量',
+     '采购单价', '运费', '其他成本', '供应商', '币种'])
+
 r = client.post('/api/v1/sources', headers=H_ADMIN,
                 files={'file': ('订单.csv', orders, 'text/csv')})
 check('上传订单 201', r.status_code == 201, r.status_code)
 sid = r.json()[0]['source_id']
+r = client.post('/api/v1/sources', headers=H_ADMIN,
+                files={'file': ('采购.csv', purchase, 'text/csv')})
+psid = r.json()[0]['source_id']
 
 # 确认映射
-r = client.get(f'/api/v1/sources/{sid}/profile', headers=H_ADMIN)
-prof = r.json()
-mapping = {m['target_field']: m['source_column'] for m in prof['mappings']}
-client.post(f'/api/v1/sources/{sid}/mapping', headers=H_ADMIN,
-            json={'mapping': mapping})
+for _sid in (sid, psid):
+    r = client.get(f'/api/v1/sources/{_sid}/profile', headers=H_ADMIN)
+    prof = r.json()
+    mapping = {m['target_field']: m['source_column'] for m in prof['mappings']}
+    client.post(f'/api/v1/sources/{_sid}/mapping', headers=H_ADMIN,
+                json={'mapping': mapping})
 
 # 第一次诊断（还有 1 次赠送额度，但 admin 不扣）
 r = client.post('/api/v1/diagnoses', headers=H_ADMIN,
-                json={'source_ids': [sid], 'time_range': '2026-10-01~2026-10-04'})
+                json={'source_ids': [sid, psid],
+                      'time_range': '2026-10-01~2026-10-04'})
 check('★ admin 发起诊断 202（不受额度检查拦截）', r.status_code == 202, r.status_code)
 DID1 = r.json()['diagnosis_id']
 for _ in range(80):
@@ -133,7 +147,7 @@ with db.transaction() as conn:
     conn.execute('UPDATE credit_accounts SET balance = 0 WHERE tenant_id = ?',
                  (u['tenant_id'],))
 r = client.post('/api/v1/diagnoses', headers=H_ADMIN,
-                json={'source_ids': [sid]})
+                json={'source_ids': [sid, psid]})
 check('★ 余额 0 时 admin 仍 202', r.status_code == 202, r.status_code)
 DID2 = r.json()['diagnosis_id']
 for _ in range(80):
@@ -165,10 +179,16 @@ H_N = {'Authorization': f'Bearer {NORMAL_TOKEN}'}
 r = client.post('/api/v1/sources', headers=H_N,
                 files={'file': ('订单.csv', orders, 'text/csv')})
 nsid = r.json()[0]['source_id']
-r = client.get(f'/api/v1/sources/{nsid}/profile', headers=H_N)
-nm = {m['target_field']: m['source_column'] for m in r.json()['mappings']}
-client.post(f'/api/v1/sources/{nsid}/mapping', headers=H_N, json={'mapping': nm})
-r = client.post('/api/v1/diagnoses', headers=H_N, json={'source_ids': [nsid]})
+r = client.post('/api/v1/sources', headers=H_N,
+                files={'file': ('采购.csv', purchase, 'text/csv')})
+npsid = r.json()[0]['source_id']
+for _sid in (nsid, npsid):
+    r = client.get(f'/api/v1/sources/{_sid}/profile', headers=H_N)
+    nm = {m['target_field']: m['source_column'] for m in r.json()['mappings']}
+    client.post(f'/api/v1/sources/{_sid}/mapping', headers=H_N,
+                json={'mapping': nm})
+r = client.post('/api/v1/diagnoses', headers=H_N,
+                json={'source_ids': [nsid, npsid]})
 check('普通用户有额度时 202', r.status_code == 202, r.status_code)
 NDID = r.json()['diagnosis_id']
 for _ in range(80):
@@ -177,10 +197,56 @@ for _ in range(80):
         break
     time.sleep(0.3)
 
-r = client.post('/api/v1/diagnoses', headers=H_N, json={'source_ids': [nsid]})
+r = client.post('/api/v1/diagnoses', headers=H_N,
+                json={'source_ids': [nsid, npsid]})
 check('★ 普通用户额度用完后 402（行为不变）', r.status_code == 402, r.status_code)
 check('错误码 INSUFFICIENT_CREDITS',
       r.json().get('code') == 'INSUFFICIENT_CREDITS')
+
+# ---------------------------------------------------------------------------
+print('\n[4.5] 补偿退款管理端（docs/16 P1-3）')
+now_iso = dt.datetime.now(dt.timezone.utc).isoformat()
+pid = uuid.uuid4().hex
+with db.transaction() as conn:
+    conn.execute(
+        'INSERT INTO refund_pending (id,tenant_id,diagnosis_id,reason,attempts,'
+        'last_error,status,note,created_at,updated_at) '
+        'VALUES (?,?,?,?,?,?,?,?,?,?)',
+        (pid, nu['tenant_id'], NDID, '测试补偿', 0, '', 'pending', '',
+         now_iso, now_iso))
+r = client.get('/api/v1/admin/refunds', headers=H_ADMIN)
+check('管理员可查看补偿列表', r.status_code == 200, r.status_code)
+check('列表包含补偿记录',
+      any(x['id'] == pid for x in r.json().get('items', [])), r.text[:100])
+r = client.get('/api/v1/admin/refunds', headers=H_N)
+check('★ 非管理员（租户 owner）访问补偿列表 403',
+      r.status_code == 403, r.status_code)
+
+bal_before_admin = client.get('/api/v1/billing/account', headers=H_N).json()['balance']
+r = client.post(f'/api/v1/admin/refunds/{pid}/retry', headers=H_ADMIN)
+check('管理员重试退款 200', r.status_code == 200, r.text[:100])
+check('补偿记录已 resolved', r.json().get('status') == 'resolved', r.json())
+bal_after_admin = client.get('/api/v1/billing/account', headers=H_N).json()['balance']
+check('★ 重试后额度已退还', bal_after_admin == bal_before_admin + 1,
+      f'{bal_before_admin} -> {bal_after_admin}')
+
+# 无法退款（无 consume）的记录 → 核销
+pid2 = uuid.uuid4().hex
+with db.transaction() as conn:
+    conn.execute(
+        'INSERT INTO refund_pending (id,tenant_id,diagnosis_id,reason,attempts,'
+        'last_error,status,note,created_at,updated_at) '
+        'VALUES (?,?,?,?,?,?,?,?,?,?)',
+        (pid2, nu['tenant_id'], 'diag-manual-x', '人工核销测试', 2, '',
+         'manual_review', '', now_iso, now_iso))
+r = client.post(f'/api/v1/admin/refunds/{pid2}/writeoff',
+                headers=H_ADMIN, params={'note': '测试核销'})
+check('管理员核销 200', r.status_code == 200, r.text[:100])
+check('核销后 resolved', r.json().get('status') == 'resolved', r.json())
+with db.get_conn() as conn:
+    st = conn.execute('SELECT status FROM refund_pending WHERE id=?',
+                      (pid2,)).fetchone()[0]
+check('核销状态已落库', st == 'resolved', st)
 
 # ---------------------------------------------------------------------------
 print('\n[5] 顺序容错：先注册（owner）→ 后配置 env → 登录提升')
