@@ -21,6 +21,11 @@ Write-Host ''
 # ---------- 定位 Python（当前 conda 环境 → PATH → 常见安装位置，逐级回退）----------
 $PythonCandidates = @()
 if ($env:CONDA_PREFIX) { $PythonCandidates += (Join-Path $env:CONDA_PREFIX 'python.exe') }
+# 本机私有配置（start.local.ps1 已加入 .gitignore，不入库）：
+#   $LocalPythonPath = 'D:\你的路径\envs\data_agent\python.exe'
+$LocalConfig = Join-Path $Root 'start.local.ps1'
+if (Test-Path $LocalConfig) { . $LocalConfig }
+if ($LocalPythonPath) { $PythonCandidates += $LocalPythonPath }
 $CmdPython = Get-Command python -ErrorAction SilentlyContinue
 # 排除 Windows 商店的 python 占位 stub（存在但不可用）
 if ($CmdPython -and $CmdPython.Source -notmatch 'WindowsApps') {
@@ -101,13 +106,16 @@ $Backend = Start-Process -FilePath $Python `
     -WorkingDirectory $Root -PassThru -WindowStyle Hidden `
     -RedirectStandardOutput $BackendLog -RedirectStandardError (Join-Path $LogDir 'backend.err.log')
 
-Start-Sleep -Seconds 6
-
-try {
-    $h = Invoke-RestMethod 'http://127.0.0.1:8000/api/v1/health' -TimeoutSec 10
+# 轮询等待就绪（固定 sleep 对冷启动不够：探测那一刻服务可能还没监听）
+$h = $null
+foreach ($i in 1..30) {
+    Start-Sleep -Seconds 1
+    try { $h = Invoke-RestMethod 'http://127.0.0.1:8000/api/v1/health' -TimeoutSec 2; break } catch {}
+}
+if ($h) {
     # 公开 health 已脱敏（P2-13），只有 status/version
     Write-Host "  后端就绪 (status=$($h.status), version=$($h.version))" -ForegroundColor Green
-} catch {
+} else {
     Write-Host '  后端启动失败，请检查 .env 与依赖；日志：' -ForegroundColor Red
     Write-Host "    $BackendLog" -ForegroundColor White
     Write-Host "    $(Join-Path $LogDir 'backend.err.log')" -ForegroundColor White
@@ -125,12 +133,14 @@ $Frontend = Start-Process -FilePath 'cmd.exe' `
     -WorkingDirectory $Web -PassThru -WindowStyle Hidden `
     -RedirectStandardOutput $FrontendLog -RedirectStandardError (Join-Path $LogDir 'frontend.err.log')
 
-Start-Sleep -Seconds 8
-
-try {
-    $r = Invoke-WebRequest 'http://127.0.0.1:5173/' -TimeoutSec 10 -UseBasicParsing
+$r = $null
+foreach ($i in 1..40) {
+    Start-Sleep -Seconds 1
+    try { $r = Invoke-WebRequest 'http://127.0.0.1:5173/' -TimeoutSec 2 -UseBasicParsing; break } catch {}
+}
+if ($r) {
     Write-Host "  前端就绪 (HTTP $($r.StatusCode))" -ForegroundColor Green
-} catch {
+} else {
     Write-Host '  前端启动失败；日志：' -ForegroundColor Red
     Write-Host "    $FrontendLog" -ForegroundColor White
 }
