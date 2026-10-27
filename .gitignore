@@ -83,10 +83,16 @@ artifacts/
 
 # --- 本地私有资料（不上传）---
 # ★ 2026-10-23 业主要求：docs/ 全部维持本地私有，不入版本控制
+# ★ 2026-10-27 调整：01/02/03 三份核心文档已脱敏入库（真实值对照表见 docs/sensitive-local.md，仅本地）
 harness_py/
 harness_py_pro/
-docs/
+docs/*
+!docs/01-DESIGN.md
+!docs/02-ARCHITECTURE.md
+!docs/03-ROADMAP.md
 README.local.md
+# 本机私有启动配置（各机器自己的 Python 路径等，start.ps1 会自动加载）
+start.local.ps1
 
 # --- 前端依赖缓存与构建临时目录 ---
 .npmcache/
